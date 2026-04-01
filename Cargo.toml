@@ -1,0 +1,6 @@
+[workspace]
+members = ["server", "vendor/qwen3-tts-rs"]
+resolver = "2"
+
+[workspace.dependencies]
+qwen3-tts = { path = "vendor/qwen3-tts-rs" }

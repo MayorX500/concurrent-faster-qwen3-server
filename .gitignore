@@ -3,3 +3,4 @@ models/
 *.wav
 *.gguf
 *.onnx
+__pycache__/

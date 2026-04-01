@@ -144,14 +144,12 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
     let model_dir = state.model_dir.clone();
     let language = parse_language(&req.language);
     let text = req.text.clone();
-    let temp = req.temperature.unwrap_or(0.7);
 
-    // Use a dedicated streaming worker thread with pre-loaded model
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>(32);
 
-    // Submit to streaming worker pool
-    let stream_req = StreamingRequest { text, language, temperature: temp, tx };
-    if let Err(_) = state.stream_tx.send(stream_req).await {
+    // Submit to streaming worker
+    let stream_req = StreamingRequest { text, language, temperature: req.temperature.unwrap_or(0.7), tx };
+    if state.stream_tx.send(stream_req).await.is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Stream engine down".into() })).into_response();
     }
 
@@ -162,7 +160,6 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
         .status(StatusCode::OK)
         .header("content-type", "audio/wav")
         .header("transfer-encoding", "chunked")
-        .header("x-streaming", "true")
         .body(body)
         .unwrap()
 }

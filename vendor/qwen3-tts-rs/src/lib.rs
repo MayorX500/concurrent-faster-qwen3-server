@@ -1322,6 +1322,219 @@ impl Qwen3TTS {
         Ok(mask.unsqueeze(1)?) // [N, 1, seq_len, seq_len]
     }
 
+    /// Batched streaming synthesis: generates audio for N sequences simultaneously,
+    /// sending decoded chunks through per-request channels every `chunk_frames` frames.
+    ///
+    /// Each sender receives `Ok(AudioBuffer)` chunks as they're generated,
+    /// then the channel is dropped when generation completes.
+    pub fn synthesize_batch_streaming(
+        &self,
+        requests: &[(String, Language)],
+        senders: &[std::sync::mpsc::Sender<AudioBuffer>],
+        chunk_frames: usize,
+    ) -> Result<()> {
+        let n = requests.len();
+        let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests
+            .iter()
+            .map(|(t, l)| (t.clone(), *l, None))
+            .collect();
+
+        // Reuse the batch setup from synthesize_batch
+        let opts0 = SynthesisOptions::default();
+        let gen_config = opts0.to_gen_config();
+
+        // Phase 1: Build prefill embeddings
+        let mut prefill_embeds: Vec<Tensor> = Vec::with_capacity(n);
+        let mut all_input_ids: Vec<Vec<u32>> = Vec::with_capacity(n);
+
+        for (text, lang, _) in &reqs {
+            let input_ids = self.text_tokenizer.encode(text)?;
+            let role_prefix = self.talker.build_role_prefix_pub()?;
+            let codec_ids = Tensor::new(
+                &[codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS,
+                  lang.token_id(), codec_tokens::CODEC_THINK_EOS,
+                  Speaker::Serena.token_id(), codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
+                &self.device,
+            )?;
+            let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
+            let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
+            let codec_first6 = codec_embed.i((.., ..6, ..))?;
+            let codec_hidden = tts_text_embed.add(&codec_first6)?;
+            let mut hidden = Tensor::cat(&[&role_prefix, &codec_hidden], 1)?;
+            let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
+            if let Some(combined) = self.talker.build_first_text_combined_pub(&input_ids, &codec_bos_embed)? {
+                hidden = Tensor::cat(&[&hidden, &combined], 1)?;
+            }
+            prefill_embeds.push(hidden);
+            all_input_ids.push(input_ids);
+        }
+
+        // Pad prefills
+        let max_prefill_len = prefill_embeds.iter().map(|e| e.dim(1).unwrap_or(0)).max().unwrap_or(0);
+        let hidden_size = prefill_embeds[0].dim(2)?;
+        let mut padded: Vec<Tensor> = Vec::with_capacity(n);
+        let mut masks: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for embed in &prefill_embeds {
+            let seq = embed.dim(1)?;
+            let pad = max_prefill_len - seq;
+            if pad > 0 {
+                let p = Tensor::zeros((1, pad, hidden_size), embed.dtype(), &self.device)?;
+                padded.push(Tensor::cat(&[&p, embed], 1)?);
+            } else {
+                padded.push(embed.clone());
+            }
+            let mut m = vec![0.0f32; pad];
+            m.extend(vec![1.0f32; seq]);
+            masks.push(m);
+        }
+
+        let batched_embed = Tensor::cat(&padded, 0)?;
+        let attn_mask = self.build_batched_causal_mask(&masks, max_prefill_len)?;
+
+        // Phase 2: Batched prefill
+        let num_layers = self.talker.layers_iter().count();
+        let mut kv_caches: Vec<models::transformer::AnyKVCache> = (0..num_layers)
+            .map(|_| models::transformer::AnyKVCache::Concat(models::kv_cache::KVCache::new()))
+            .collect();
+
+        let mut hidden = batched_embed;
+        for (i, layer) in self.talker.layers_iter().enumerate() {
+            hidden = layer.forward(&hidden, self.talker.rope(), Some(&attn_mask), Some(&mut kv_caches[i]), 0)?;
+        }
+        hidden = self.talker.apply_norm(&hidden)?;
+
+        let mut last_hiddens: Vec<Tensor> = Vec::with_capacity(n);
+        let mut last_logits: Vec<Tensor> = Vec::with_capacity(n);
+        for i in 0..n {
+            let h_i = hidden.i(i..i + 1)?;
+            let last_h = h_i.i((.., max_prefill_len - 1..max_prefill_len, ..))?;
+            let logits = self.talker.apply_codec_head(&last_h)?;
+            last_hiddens.push(last_h);
+            last_logits.push(logits);
+        }
+
+        // Setup generation state
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        let suppression_mask = generation::build_suppression_mask(
+            codec_tokens::CODEC_VOCAB_SIZE, CODEC_EOS_TOKEN_ID, &self.device,
+        )?;
+        let mut done: Vec<bool> = vec![false; n];
+        let mut penalty_masks: Vec<Tensor> = (0..n)
+            .map(|_| Tensor::zeros((1, codec_tokens::CODEC_VOCAB_SIZE), DType::F32, &self.device))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut sampling_ctxs: Vec<generation::SamplingContext> = (0..n)
+            .map(|_| generation::SamplingContext::new(None)).collect();
+        let mut all_trailing: Vec<Tensor> = Vec::with_capacity(n);
+        let mut all_trailing_len: Vec<usize> = Vec::with_capacity(n);
+        for ids in &all_input_ids {
+            let trailing = self.build_default_trailing_text(ids)?;
+            let tlen = trailing.dim(1)?;
+            all_trailing.push(trailing);
+            all_trailing_len.push(tlen);
+        }
+
+        let mut semantic_tokens: Vec<Tensor> = Vec::with_capacity(n);
+        let mut semantic_ids: Vec<u32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let logits_2d = last_logits[i].squeeze(1)?;
+            let logits_2d = self.apply_generation_penalties_gpu(
+                &logits_2d, &penalty_masks[i], &gen_config, 0, Some(&suppression_mask),
+            )?;
+            let tok = generation::sample(&logits_2d, &gen_config, &mut sampling_ctxs[i])?;
+            let id: u32 = tok.flatten_all()?.to_vec1::<u32>()?[0];
+            Self::update_penalty_mask(&mut penalty_masks[i], id, codec_tokens::CODEC_VOCAB_SIZE)?;
+            semantic_tokens.push(tok);
+            semantic_ids.push(id);
+        }
+
+        let mut cp_kv_caches: Vec<Vec<models::transformer::AnyKVCache>> =
+            (0..n).map(|_| self.code_predictor.new_kv_caches()).collect();
+        let mut offset = max_prefill_len;
+
+        // Frame buffers for chunked decode
+        let mut frame_buffers: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
+
+        // Phase 3: Batched generation with streaming decode
+        for frame_idx in 0..gen_config.max_new_tokens {
+            for i in 0..n {
+                if !done[i] {
+                    if let Some(eos_id) = gen_config.eos_token_id {
+                        if semantic_ids[i] == eos_id { done[i] = true; }
+                    }
+                }
+            }
+            if done.iter().all(|&d| d) { break; }
+
+            let mut step_inputs: Vec<Tensor> = Vec::with_capacity(n);
+            for i in 0..n {
+                if done[i] {
+                    step_inputs.push(Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?);
+                    continue;
+                }
+                let semantic_embed = self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i])?;
+                let acoustic_codes = self.code_predictor.generate_acoustic_codes(
+                    &last_hiddens[i], &semantic_embed, &mut cp_kv_caches[i],
+                )?;
+                let frame_tensor = Tensor::cat(&[&semantic_tokens[i].reshape(1)?, &acoustic_codes], 0)?;
+                let frame_vec: Vec<u32> = frame_tensor.to_vec1()?;
+                frame_buffers[i].push(frame_vec);
+
+                let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(&acoustic_codes)?;
+                let summed = semantic_embed.add(&acoustic_sum)?;
+                let text_addition = if frame_idx < all_trailing_len[i] {
+                    all_trailing[i].i((.., frame_idx..frame_idx + 1, ..))?
+                } else { tts_pad_embed.clone() };
+                step_inputs.push(summed.add(&text_addition)?);
+            }
+
+            // Batched forward
+            let batched_input = Tensor::cat(&step_inputs, 0)?;
+            let mut batched_hidden = batched_input;
+            for (layer_idx, layer) in self.talker.layers_iter().enumerate() {
+                batched_hidden = layer.forward(
+                    &batched_hidden, self.talker.rope(), None, Some(&mut kv_caches[layer_idx]), offset,
+                )?;
+            }
+            offset += 1;
+            batched_hidden = self.talker.apply_norm(&batched_hidden)?;
+            let batched_logits = self.talker.apply_codec_head(&batched_hidden)?;
+
+            for i in 0..n {
+                if done[i] { continue; }
+                last_hiddens[i] = batched_hidden.i(i..i + 1)?;
+                let logits_i = batched_logits.i(i..i + 1)?.squeeze(1)?;
+                let logits_i = self.apply_generation_penalties_gpu(
+                    &logits_i, &penalty_masks[i], &gen_config, frame_idx + 1, Some(&suppression_mask),
+                )?;
+                semantic_tokens[i] = generation::sample(&logits_i, &gen_config, &mut sampling_ctxs[i])?;
+                semantic_ids[i] = semantic_tokens[i].flatten_all()?.to_vec1::<u32>()?[0];
+                Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
+            }
+
+            // Decode and send chunks every chunk_frames
+            if (frame_idx + 1) % chunk_frames == 0 {
+                for i in 0..n {
+                    if frame_buffers[i].is_empty() { continue; }
+                    if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
+                        let _ = senders[i].send(audio);
+                    }
+                    frame_buffers[i].clear();
+                }
+            }
+        }
+
+        // Flush remaining frames
+        for i in 0..n {
+            if !frame_buffers[i].is_empty() {
+                if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
+                    let _ = senders[i].send(audio);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a streaming synthesis session with a specific voice and language.
     ///
     /// Returns an iterator that yields audio chunks as they are generated.

@@ -856,6 +856,14 @@ impl TalkerModel {
         self.get_projected_special_embed(tts_tokens::TTS_PAD)
     }
 
+    // Public wrappers for batched inference
+    pub fn build_role_prefix_pub(&self) -> Result<Tensor> { self.build_role_prefix() }
+    pub fn build_tts_pad_bos_pub(&self, pad_count: usize) -> Result<Tensor> { self.build_tts_pad_bos(pad_count) }
+    pub fn codec_embedding_forward(&self, ids: &Tensor) -> Result<Tensor> { Ok(self.codec_embedding.forward(ids)?) }
+    pub fn build_first_text_combined_pub(&self, text_tokens: &[u32], codec_bos_embed: &Tensor) -> Result<Option<Tensor>> {
+        self.build_first_text_combined(text_tokens, codec_bos_embed)
+    }
+
     /// Get tts_eos text embedding (projected).
     ///
     /// This marks the end of text input.

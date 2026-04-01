@@ -98,9 +98,35 @@ impl BatchEngine {
 
             let t0 = Instant::now();
 
-            // Process sequentially on single GPU thread — no contention,
-            // GPU stays warm between requests. Each request gets ~1.1x RT.
-            // Total throughput = N * 1.1x RT / N = 1.1x RT constant.
+            if batch_size > 1 {
+                // Try batched forward pass (all sequences in one GPU pass)
+                let requests: Vec<(String, qwen3_tts::Language, Option<SynthesisOptions>)> = batch
+                    .iter()
+                    .map(|r| (r.text.clone(), r.language, Some(r.options.clone())))
+                    .collect();
+
+                match model.synthesize_batch(&requests) {
+                    Ok(audios) => {
+                        let gen_time = t0.elapsed().as_secs_f32();
+                        let per_req = gen_time / audios.len() as f32;
+                        info!(batch_size, gen_time, per_req, "Batched forward complete");
+                        for (req, audio) in batch.into_iter().zip(audios) {
+                            let _ = req.reply.send(Ok(BatchResult {
+                                audio,
+                                gen_time_secs: per_req,
+                            }));
+                        }
+                        let total = t0.elapsed().as_secs_f32();
+                        info!(batch_size, total_secs = total, "Batch complete");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Batched forward failed: {e:#}, falling back to sequential");
+                    }
+                }
+            }
+
+            // Fallback: sequential processing
             for req in batch {
                 let t_req = Instant::now();
                 let result = Self::process_single(&model, &req);
@@ -113,7 +139,7 @@ impl BatchEngine {
             }
 
             let total = t0.elapsed().as_secs_f32();
-            info!(batch_size, total_secs = total, "Batch complete");
+            info!(total_secs = total, "Sequential fallback complete");
         }
 
         Ok(())

@@ -1200,6 +1200,9 @@ impl Qwen3TTS {
             semantic_ids.push(init_ids[i]);
         }
 
+        // Pre-allocate zero tensor for done sequences (avoid per-frame allocation)
+        let zero_input = Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?;
+
         let mut cp_kv_caches: Vec<Vec<models::transformer::AnyKVCache>> =
             (0..n).map(|_| self.code_predictor.new_kv_caches()).collect();
         let mut offset = max_prefill_len;
@@ -1239,7 +1242,7 @@ impl Qwen3TTS {
             let mut gpu_frames: Vec<Option<Tensor>> = vec![None; n];
             for i in 0..n {
                 if done[i] {
-                    step_inputs.push(Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?);
+                    step_inputs.push(zero_input.clone());
                     continue;
                 }
 

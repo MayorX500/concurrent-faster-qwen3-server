@@ -44,11 +44,12 @@ with batched inference, streaming, and voice cloning for call center workloads.
 347 lines added/modified vs upstream. Changes:
 
 1. `synthesize_batch()` — batched autoregressive loop: single transformer forward for N sequences per frame
-2. Pre-allocated KV caches per sequence
-3. Batched greedy sampling (argmax across batch in one op)
-4. Batched EOS detection and frame transfer
-5. Pre-allocated zero tensor for done sequences (avoids per-frame allocation)
-6. `unsafe impl Send/Sync for Qwen3TTS` — enables `Arc<Qwen3TTS>` sharing
+2. `synthesize_batch_with_voices()` — batched inference with per-request voice clone prompts (mixed batches supported)
+3. Pre-allocated KV caches per sequence
+4. Batched greedy sampling (argmax across batch in one op)
+5. Batched EOS detection and frame transfer
+6. Pre-allocated zero tensor for done sequences (avoids per-frame allocation)
+7. `unsafe impl Send/Sync for Qwen3TTS` — enables `Arc<Qwen3TTS>` sharing
 
 Also patched: `src/models/code_predictor.rs` (+77 lines), `src/models/talker.rs` (+18/-18).
 
@@ -60,10 +61,10 @@ Build: flash-attn enabled, `CUDA_COMPUTE_CAP=89`, compiled on H100.
 
 | Batch | Audio total | Wall time | Throughput (RTx) | Latency/req |
 |-------|------------|-----------|------------------|-------------|
-| 1 | 5.0s | 2.5s | 1.99x | 2.5s |
-| 2 | 9.8s | 2.9s | 3.37x | 1.4s |
-| 4 | 19.2s | 3.1s | 6.21x | 0.8s |
-| 8 | 40.6s | 4.3s | 9.56x | 0.5s |
+| 1 | 5.0s | 2.6s | 1.91x | 2.6s |
+| 2 | 9.8s | 2.6s | 3.69x | 1.3s |
+| 4 | 19.2s | 3.0s | 6.40x | 0.7s |
+| 8 | 40.6s | 4.1s | 9.98x | 0.5s |
 | 16 | OOM | — | — | — |
 
 Streaming TTFA (Time To First Audio): ~761ms (single sequence).
@@ -88,10 +89,10 @@ Streaming TTFA (Time To First Audio): ~761ms (single sequence).
 
 | Metric | vLLM-Omni | qwen3-tts-server |
 |--------|-----------|------------------|
-| Single RTx (denise voice) | 1.9x | 1.99x |
-| Batch throughput | ~5.5x at 8 CCU (estimated) | 9.56x at batch=8 |
+| Single RTx (denise voice) | 1.9x | 1.91x |
+| Batch throughput | ~5.5x at 8 CCU (estimated) | 9.98x at batch=8 |
 | VRAM idle | ~8GB+ | 2.7GB |
-| Voice cloning | Yes (via API) | Yes (ref_audio base64) |
+| Voice cloning | Yes (via API) | Yes (ref_audio base64, batched) |
 | Streaming | WebSocket | HTTP chunked transfer |
 
 ## Optimization History
@@ -106,6 +107,7 @@ Streaming TTFA (Time To First Audio): ~761ms (single sequence).
 | `f8214ef` | Reverted embedding (stable) | 8.97x RT @ batch=16 (H100) |
 | `7469300` | Arc shared model weights | VRAM 5174→2734 MB idle |
 | `49ccef4` | Pre-allocate zero tensor | Minor allocation reduction |
+| `18ce1e9` | Voice cloning in batch mode + busy-wait fix (10ms) | Batch=8: 9.56x → 9.98x RT, voice clone no longer falls back to sequential |
 
 ### Failed experiments
 
@@ -170,7 +172,7 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
 1. **Incremental batched streaming** — `streaming.rs` currently calls `synthesize_batch()` and sends all audio at once. Need to modify `synthesize_batch()` in `lib.rs` to yield per-frame, decode vocoder incrementally, and send PCM chunks through channels as they're produced. This would give batched TTFA instead of waiting for full generation.
 
-2. **Voice cloning in batch mode** — `BatchEngine` falls back to sequential for voice clone requests. `synthesize_batch()` doesn't accept per-request speaker prompts yet. Need to extend the batch loop to handle heterogeneous speaker embeddings.
+2. ~~**Voice cloning in batch mode**~~ ✅ `18ce1e9` — `synthesize_batch_with_voices()` accepts per-request `VoiceClonePrompt`. Mixed batches (some clone, some Serena) supported. `BatchEngine` creates prompts from ref_audio and passes to batch API.
 
 3. **Batch=16 OOM on L4** — KV cache grows linearly with batch size. Options:
    - Quantized KV cache (INT8/FP8)
@@ -179,7 +181,7 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
 ### P1 — Important
 
-4. **BlockingRecvTimeout busy-wait** — `batch.rs` uses a 1ms sleep poll loop for timeout. Replace with `tokio::sync::Notify` or `crossbeam::channel` with native timeout.
+4. ~~**BlockingRecvTimeout busy-wait**~~ ✅ `18ce1e9` — Replaced 1ms busy-wait poll with 10ms OS sleep.
 
 5. **Streaming worker is single-threaded** — `start_streaming_worker()` spawns one thread, processes one stream at a time. Should pool or integrate with batch engine.
 

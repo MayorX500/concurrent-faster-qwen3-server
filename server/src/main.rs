@@ -176,10 +176,11 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
 
     std::thread::spawn(move || {
-        info!("Streaming worker ready");
+        info!("Streaming worker ready (batched)");
 
         loop {
-            let req = {
+            // Block on first request
+            let first = {
                 let mut guard = rx.lock().unwrap();
                 match guard.blocking_recv() {
                     Some(r) => r,
@@ -187,28 +188,56 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
                 }
             };
 
-            let opts = SynthesisOptions { temperature: req.temperature, ..SynthesisOptions::default() };
-            let mut session = match model.synthesize_streaming(
-                &req.text, qwen3_tts::Speaker::Serena, req.language, opts,
-            ) {
-                Ok(s) => s,
-                Err(e) => { let _ = req.tx.blocking_send(Err(format!("{e}"))); continue; }
-            };
-
-            // WAV header
-            let header = wav_header(24000, 0xFFFFFFFF);
-            if req.tx.blocking_send(Ok(header)).is_err() { continue; }
-
+            // Collect more requests within 50ms for batching
+            let mut batch = vec![first];
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             loop {
-                match session.next_chunk() {
-                    Ok(Some(audio)) => {
-                        let pcm = samples_to_pcm16(&audio.samples);
-                        if req.tx.blocking_send(Ok(pcm)).is_err() { break; }
+                if batch.len() >= 8 { break; }
+                let mut guard = rx.lock().unwrap();
+                match guard.try_recv() {
+                    Ok(r) => { batch.push(r); }
+                    Err(_) => {
+                        drop(guard);
+                        if std::time::Instant::now() >= deadline { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
                 }
             }
+
+            let n = batch.len();
+            info!(batch_size = n, "Streaming batch");
+
+            let requests: Vec<(String, qwen3_tts::Language)> = batch.iter()
+                .map(|r| (r.text.clone(), r.language)).collect();
+            let (senders, receivers): (Vec<_>, Vec<_>) = (0..n)
+                .map(|_| std::sync::mpsc::channel::<qwen3_tts::AudioBuffer>()).unzip();
+
+            // Send WAV headers
+            for req in &batch {
+                let _ = req.tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF)));
+            }
+
+            // Forward decoded audio chunks: std::sync → tokio channels as PCM
+            let forwards: Vec<std::thread::JoinHandle<()>> = receivers.into_iter()
+                .zip(batch.iter().map(|r| r.tx.clone()))
+                .map(|(rx, tx)| {
+                    std::thread::spawn(move || {
+                        while let Ok(audio) = rx.recv() {
+                            let pcm = samples_to_pcm16(&audio.samples);
+                            if tx.blocking_send(Ok(pcm)).is_err() { break; }
+                        }
+                    })
+                }).collect();
+
+            // Run batched streaming (decodes + sends every 10 frames ~800ms)
+            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, 10) {
+                for req in &batch {
+                    let _ = req.tx.blocking_send(Err(format!("{e}")));
+                }
+            }
+
+            drop(senders);
+            for f in forwards { let _ = f.join(); }
         }
     });
 

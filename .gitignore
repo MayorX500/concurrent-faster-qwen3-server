@@ -4,3 +4,4 @@ models/
 *.gguf
 *.onnx
 __pycache__/
+*-flash

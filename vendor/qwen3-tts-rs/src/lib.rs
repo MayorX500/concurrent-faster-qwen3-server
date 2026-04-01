@@ -1176,12 +1176,6 @@ impl Qwen3TTS {
 
         let mut all_codes: Vec<FrameCodes> = (0..n).map(|_| Vec::new()).collect();
         let mut done: Vec<bool> = vec![false; n];
-        let mut penalty_masks: Vec<Tensor> = (0..n)
-            .map(|_| Tensor::zeros((1, codec_tokens::CODEC_VOCAB_SIZE), DType::F32, &self.device))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut sampling_ctxs: Vec<generation::SamplingContext> = (0..n)
-            .map(|_| generation::SamplingContext::new(None))
-            .collect();
 
         // Build trailing text for each sequence
         let mut all_trailing: Vec<Tensor> = Vec::with_capacity(n);
@@ -1193,19 +1187,17 @@ impl Qwen3TTS {
             all_trailing_len.push(tlen);
         }
 
-        // Sample initial tokens
+        // Batched initial token sampling (same greedy path as main loop)
+        let init_logits = Tensor::cat(&last_logits, 0)?.squeeze(1)?.to_dtype(candle_core::DType::F32)?;
+        let init_suppressed = generation::apply_token_suppression_with_mask(&init_logits, &suppression_mask)?;
+        let init_tokens = init_suppressed.argmax(candle_core::D::Minus1)?;
+        let init_ids: Vec<u32> = init_tokens.flatten_all()?.to_vec1()?;
+
         let mut semantic_tokens: Vec<Tensor> = Vec::with_capacity(n);
         let mut semantic_ids: Vec<u32> = Vec::with_capacity(n);
         for i in 0..n {
-            let logits_2d = last_logits[i].squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties_gpu(
-                &logits_2d, &penalty_masks[i], &gen_config, 0, Some(&suppression_mask),
-            )?;
-            let tok = generation::sample(&logits_2d, &gen_config, &mut sampling_ctxs[i])?;
-            let id: u32 = tok.flatten_all()?.to_vec1::<u32>()?[0];
-            Self::update_penalty_mask(&mut penalty_masks[i], id, codec_tokens::CODEC_VOCAB_SIZE)?;
-            semantic_tokens.push(tok);
-            semantic_ids.push(id);
+            semantic_tokens.push(init_tokens.i(i)?);
+            semantic_ids.push(init_ids[i]);
         }
 
         let mut cp_kv_caches: Vec<Vec<models::transformer::AnyKVCache>> =
@@ -1226,10 +1218,13 @@ impl Qwen3TTS {
             // BATCHED code predictor: all active sequences in one pass
             let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
 
-            // Batched semantic embedding lookup
-            let active_semantic_embeds: Vec<Tensor> = active.iter()
-                .map(|&i| self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i]))
-                .collect::<Result<Vec<_>>>()?;
+            // Batched semantic embedding: stack tokens → single embedding lookup
+            let active_tokens: Vec<&Tensor> = active.iter().map(|&i| &semantic_tokens[i]).collect();
+            let stacked_tokens = Tensor::stack(&active_tokens, 0)?; // [A]
+            let active_semantic_embeds_batched = self.talker.get_codec_embedding_batch(&stacked_tokens)?; // [A, 1, hidden]
+            let active_semantic_embeds: Vec<Tensor> = (0..active.len())
+                .map(|j| active_semantic_embeds_batched.i(j..j+1))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let active_hiddens: Vec<Tensor> = active.iter()
                 .map(|&i| last_hiddens[i].clone())
                 .collect();
@@ -1307,9 +1302,6 @@ impl Qwen3TTS {
             for i in 0..n {
                 semantic_tokens[i] = new_tokens[i].clone();
                 semantic_ids[i] = all_ids[i];
-                if !done[i] {
-                    Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
-                }
             }
 
             // Bulk transfer frame codes (single sync)
@@ -1335,15 +1327,17 @@ impl Qwen3TTS {
             }
         }
 
-        // Phase 4: Decode each sequence
-        let mut results = Vec::with_capacity(n);
-        for codes in &all_codes {
-            if codes.is_empty() {
-                results.push(AudioBuffer::new(vec![], 24000));
-            } else {
-                results.push(self.decode_codes(codes)?);
-            }
-        }
+        // Phase 4: Parallel decode each sequence (CPU-bound, use rayon)
+        use rayon::prelude::*;
+        let results: Vec<AudioBuffer> = all_codes.par_iter()
+            .map(|codes| {
+                if codes.is_empty() {
+                    AudioBuffer::new(vec![], 24000)
+                } else {
+                    self.decode_codes(codes).unwrap_or_else(|_| AudioBuffer::new(vec![], 24000))
+                }
+            })
+            .collect();
         Ok(results)
     }
 

@@ -1,4 +1,5 @@
 mod batch;
+mod streaming;
 
 use anyhow::Result;
 use axum::{

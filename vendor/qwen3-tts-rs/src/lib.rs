@@ -1220,14 +1220,13 @@ impl Qwen3TTS {
             // BATCHED code predictor: all active sequences in one pass
             let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
 
-            // Stack semantic embeddings for active sequences
+            // Batched semantic embedding lookup
             let active_semantic_embeds: Vec<Tensor> = active.iter()
                 .map(|&i| self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i]))
                 .collect::<Result<Vec<_>>>()?;
             let active_hiddens: Vec<Tensor> = active.iter()
                 .map(|&i| last_hiddens[i].clone())
                 .collect();
-
             let batched_hiddens = Tensor::cat(&active_hiddens, 0)?;
             let batched_sem_embeds = Tensor::cat(&active_semantic_embeds, 0)?;
 
@@ -1247,7 +1246,7 @@ impl Qwen3TTS {
                 }
 
                 let acoustic_codes = &batched_acoustic[active_idx];
-                let semantic_embed = &active_semantic_embeds[active_idx];
+                let semantic_embed_i = &active_semantic_embeds[active_idx];
                 active_idx += 1;
 
                 // Keep frame on GPU — defer to_vec1 to end
@@ -1255,7 +1254,7 @@ impl Qwen3TTS {
                 gpu_frames[i] = Some(frame_tensor);
 
                 let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(acoustic_codes)?;
-                let summed = semantic_embed.add(&acoustic_sum)?;
+                let summed = semantic_embed_i.add(&acoustic_sum)?;
 
                 let text_addition = if frame_idx < all_trailing_len[i] {
                     all_trailing[i].i((.., frame_idx..frame_idx + 1, ..))?

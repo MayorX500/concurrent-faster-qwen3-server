@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, SynthesisOptions};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -35,8 +36,6 @@ pub struct BatchEngineConfig {
     pub max_batch_size: usize,
     /// Maximum time to wait for a full batch before processing partial batch (ms)
     pub max_wait_ms: u64,
-    /// Model directory path
-    pub model_dir: String,
 }
 
 /// The batch engine runs on a dedicated thread, collecting requests
@@ -46,11 +45,11 @@ pub struct BatchEngine;
 impl BatchEngine {
     /// Start the batch engine on a dedicated thread.
     /// Returns a sender for submitting requests.
-    pub fn start(config: BatchEngineConfig) -> mpsc::Sender<BatchRequest> {
+    pub fn start(model: Arc<Qwen3TTS>, config: BatchEngineConfig) -> mpsc::Sender<BatchRequest> {
         let (tx, rx) = mpsc::channel::<BatchRequest>(config.max_batch_size * 4);
 
         std::thread::spawn(move || {
-            if let Err(e) = Self::run_loop(rx, config) {
+            if let Err(e) = Self::run_loop(rx, config, &model) {
                 tracing::error!("Batch engine crashed: {e:#}");
             }
         });
@@ -61,11 +60,8 @@ impl BatchEngine {
     fn run_loop(
         mut rx: mpsc::Receiver<BatchRequest>,
         config: BatchEngineConfig,
+        model: &Qwen3TTS,
     ) -> Result<()> {
-        let device = qwen3_tts::auto_device()?;
-        info!(?device, "Batch engine loading model");
-
-        let model = Qwen3TTS::from_pretrained(&config.model_dir, device.clone())?;
         info!("Batch engine ready, max_batch={}", config.max_batch_size);
 
         loop {

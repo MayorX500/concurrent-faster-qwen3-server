@@ -172,6 +172,12 @@ pub struct Qwen3TTS {
     compute_dtype: DType,
 }
 
+// SAFETY: Qwen3TTS weights are read-only after construction.
+// All mutable state (KV caches) is allocated per-request as local variables.
+// CUDA operations serialize on the GPU stream, so concurrent &self calls are safe.
+unsafe impl Send for Qwen3TTS {}
+unsafe impl Sync for Qwen3TTS {}
+
 impl Qwen3TTS {
     /// Load a model from a HuggingFace model ID or local path.
     ///

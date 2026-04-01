@@ -171,13 +171,11 @@ struct StreamingRequest {
     tx: mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
-fn start_streaming_worker(model_dir: String) -> mpsc::Sender<StreamingRequest> {
+fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<StreamingRequest> {
     let (tx, rx) = mpsc::channel::<StreamingRequest>(16);
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
 
     std::thread::spawn(move || {
-        let device = qwen3_tts::auto_device().expect("No device");
-        let model = qwen3_tts::Qwen3TTS::from_pretrained(&model_dir, device).expect("Failed to load");
         info!("Streaming worker ready");
 
         loop {
@@ -243,8 +241,13 @@ async fn main() -> Result<()> {
 
     info!(model_dir = %model_dir, max_batch, max_wait_ms, port, "Starting qwen3-tts-server");
 
-    let tx = BatchEngine::start(BatchEngineConfig { max_batch_size: max_batch, max_wait_ms, model_dir: model_dir.clone() });
-    let stream_tx = start_streaming_worker(model_dir.clone());
+    let device = qwen3_tts::auto_device()?;
+    info!(?device, "Loading shared model");
+    let model = Arc::new(qwen3_tts::Qwen3TTS::from_pretrained(&model_dir, device)?);
+    info!("Shared model loaded");
+
+    let tx = BatchEngine::start(model.clone(), BatchEngineConfig { max_batch_size: max_batch, max_wait_ms });
+    let stream_tx = start_streaming_worker(model.clone());
     let max_inflight = max_batch * 2;
 
     let state = Arc::new(AppState {

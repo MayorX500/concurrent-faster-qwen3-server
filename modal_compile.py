@@ -45,23 +45,18 @@ def compile():
         print(f"BUILD FAILED:\n{r.stderr[-3000:]}")
         return {"error": "build failed", "stderr": r.stderr[-3000:]}
 
-    binary = "/src/target/release/qwen3-tts-server"
-    if not os.path.exists(binary):
-        print("Binary not found, listing executables...")
-        for f in sorted(os.listdir("/src/target/release/")):
-            fp = f"/src/target/release/{f}"
-            if os.path.isfile(fp) and os.access(fp, os.X_OK) and not f.endswith(".d"):
-                print(f"  {f} ({os.path.getsize(fp)/1024/1024:.1f}MB)")
-        return {"error": "binary not found"}
-
-    size = os.path.getsize(binary)
-    print(f"Binary size: {size / 1024 / 1024:.1f} MB")
-
-    shutil.copy2(binary, "/out/qwen3-tts-server")
+    # Copy all executables to volume
+    results = {}
+    for f in sorted(os.listdir("/src/target/release/")):
+        fp = f"/src/target/release/{f}"
+        if os.path.isfile(fp) and os.access(fp, os.X_OK) and not f.endswith(".d") and "." not in f:
+            size = os.path.getsize(fp)
+            if size > 1_000_000:  # >1MB = real binary
+                shutil.copy2(fp, f"/out/{f}")
+                results[f] = round(size / 1024 / 1024, 1)
+                print(f"  {f}: {results[f]}MB")
     vol.commit()
-    print("Saved to volume tts-compiled:/qwen3-tts-server")
-
-    return {"status": "ok", "size_mb": round(size / 1024 / 1024, 1)}
+    return {"status": "ok", "binaries": results}
 
 
 @app.function(image=image, volumes={"/out": vol})

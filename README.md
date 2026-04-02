@@ -14,14 +14,26 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 
 ## Performance (NVIDIA L4, 23GB)
 
-| Batch | Throughput | Latency/req | Concurrent calls (real-time) |
-|-------|-----------|-------------|------------------------------|
-| 1 | 2.12x RT | 2.4s | 2 |
-| 4 | 6.99x RT | 0.7s | 6 |
-| 8 | 11.49x RT | 0.4s | 11 |
-| 16 | 16.59x RT | 0.3s | 16 |
+| Batch | Throughput | Latency/req | Concurrent calls (real-time) | VRAM |
+|-------|-----------|-------------|------------------------------|------|
+| 1 | 2.12x RT | 2.4s | 2 | 2.7GB |
+| 4 | 6.99x RT | 0.7s | 6 | ~3.5GB |
+| 8 | 11.49x RT | 0.4s | 11 | ~4GB |
+| 16 | 16.59x RT | 0.3s | 16 | ~5GB |
 
 Streaming TTFA: 450ms. In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
+
+### vs other TTS models (L4)
+
+| Model | Batching | Best Throughput | Voice Clone | VRAM |
+|-------|----------|----------------|-------------|------|
+| **qwen3-tts-server** (ours) | ✅ Batch=16 | **16.59x RT** | ✅ ICL + x_vector | 2.7GB idle |
+| OmniVoice 0.6B | ❌ Sequential | 6.8x RT | ✅ (slow: 0.25x RT) | 1.9GB |
+| Kokoro 82M | ❌ Single | 15x RT | ✅ (via RVC) | 0.3GB |
+| Supertonic 2 66M | ONNX threads | 68x RT | ❌ (10 fixed) | 0 (CPU) |
+| Higgs Audio V2 3B | ✅ vLLM | 8.0x RT @8 CCU | ✅ | 38GB (L40S only) |
+
+Full comparison with 29+ models: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALUATION.md)
 
 ## Requirements
 

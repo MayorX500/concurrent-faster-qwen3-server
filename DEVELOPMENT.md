@@ -114,6 +114,9 @@ Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces K
 | `059ac10` | Adaptive max_length + OOM batch splitting | Batch=16 on L4: 13.43x RT (0.4s/req), KV cache 2048→122 for call center text |
 | `23ba457` | /metrics endpoint + streaming format header | Prometheus-compatible metrics, atomic counters, x-audio-format header |
 | `4838106` | Batched vocoder decoding | Batch=16: 13.43x → 16.59x RT (+24%), TTFA 482ms → 450ms |
+| `698e705` | Production-readiness fixes (#10) | Queue depth, streaming temperature, voice clone errors, temp cleanup |
+| `dffa961` | Hardening (#11-#14) | Cargo profiles, mutex recovery, temp-file write check, explicit clone errors |
+| `19bc541` | Server unit tests (#15) | 10 tests covering API paths, Drop cleanup, metrics |
 
 ### Failed experiments
 

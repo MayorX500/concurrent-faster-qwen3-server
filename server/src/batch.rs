@@ -103,11 +103,35 @@ impl BatchEngine {
             let t0 = Instant::now();
 
             if batch_size > 1 {
-                // Try batched forward pass (all sequences in one GPU pass)
+                // Build per-request voice clone prompts; fail requests where clone was requested but failed
+                let mut failed_indices = Vec::new();
+                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = batch
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, r)| {
+                        r.voice_clone.as_ref().and_then(|vc| {
+                            match qwen3_tts::AudioBuffer::load(&vc.ref_audio_path) {
+                                Ok(ref_buf) => match model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()) {
+                                    Ok(prompt) => Some(prompt),
+                                    Err(e) => { warn!("Voice clone prompt failed: {e:#}"); failed_indices.push(idx); None }
+                                },
+                                Err(e) => { warn!("Voice clone ref_audio load failed: {e:#}"); failed_indices.push(idx); None }
+                            }
+                        })
+                    })
+                    .collect();
+
+                // Send errors for failed voice clone requests before batching
+                for &idx in failed_indices.iter().rev() {
+                    let req = batch.remove(idx);
+                    let _ = req.reply.send(Err(anyhow::anyhow!("Voice clone failed")));
+                }
+                if batch.is_empty() { continue; }
+
+                // Rebuild requests/prompts without failed entries
                 let requests: Vec<(String, qwen3_tts::Language, Option<SynthesisOptions>)> = batch
                     .iter()
                     .map(|r| {
-                        // Adaptive max_length: ~6 frames per word, capped at 512 for call center
                         let word_count = r.text.split_whitespace().count();
                         let adaptive_max = ((word_count * 6) + 50).min(512).max(100);
                         let mut opts = r.options.clone();
@@ -115,22 +139,13 @@ impl BatchEngine {
                         (r.text.clone(), r.language, Some(opts))
                     })
                     .collect();
-
-                // Build per-request voice clone prompts
-                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = batch
-                    .iter()
-                    .map(|r| {
-                        r.voice_clone.as_ref().and_then(|vc| {
-                            match qwen3_tts::AudioBuffer::load(&vc.ref_audio_path) {
-                                Ok(ref_buf) => match model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()) {
-                                    Ok(prompt) => Some(prompt),
-                                    Err(e) => { warn!("Voice clone prompt failed: {e:#}"); None }
-                                },
-                                Err(e) => { warn!("Voice clone ref_audio load failed: {e:#}"); None }
-                            }
-                        })
-                    })
-                    .collect();
+                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = {
+                    let mut kept = Vec::new();
+                    for (idx, p) in prompts.into_iter().enumerate() {
+                        if !failed_indices.contains(&idx) { kept.push(p); }
+                    }
+                    kept
+                };
                 let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
                     prompts.iter().map(|p| p.as_ref()).collect();
 

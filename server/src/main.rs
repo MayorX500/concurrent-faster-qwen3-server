@@ -226,7 +226,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
         loop {
             // Block on first request
             let first = {
-                let mut guard = rx.lock().expect("streaming worker mutex poisoned");
+                let mut guard = rx.lock().unwrap_or_else(|e| { tracing::error!("streaming mutex poisoned, recovering"); e.into_inner() });
                 match guard.blocking_recv() {
                     Some(r) => r,
                     None => break,
@@ -238,7 +238,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             loop {
                 if batch.len() >= 8 { break; }
-                let mut guard = rx.lock().expect("streaming worker mutex poisoned");
+                let mut guard = rx.lock().unwrap_or_else(|e| { tracing::error!("streaming mutex poisoned, recovering"); e.into_inner() });
                 match guard.try_recv() {
                     Ok(r) => { batch.push(r); }
                     Err(_) => {
@@ -293,12 +293,13 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
 
 fn decode_ref_audio(req: &SpeechRequest) -> Option<VoiceCloneData> {
     req.ref_audio.as_ref().and_then(|b64| {
-        base64::engine::general_purpose::STANDARD.decode(b64).ok().map(|bytes| {
-            let tmp = std::env::temp_dir().join(format!("ref_{}.wav",
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
-            std::fs::write(&tmp, &bytes).ok();
-            VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone() }
-        })
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+        let tmp = std::env::temp_dir().join(format!("ref_{}.wav",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+        match std::fs::write(&tmp, &bytes) {
+            Ok(_) => Some(VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone() }),
+            Err(e) => { tracing::error!("Failed to write ref_audio temp file: {e}"); None }
+        }
     })
 }
 

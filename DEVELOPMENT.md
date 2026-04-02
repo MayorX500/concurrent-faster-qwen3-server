@@ -113,6 +113,7 @@ Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces K
 | `31acfab` | Batched streaming worker (up to 8 concurrent streams) | Streaming uses `synthesize_batch_streaming`, decodes every 10 frames |
 | `1c3fc94` | Batched code predictor in streaming path | TTFA 761ms → 490ms, streaming now uses `generate_acoustic_codes_batched()` |
 | `059ac10` | Adaptive max_length + OOM batch splitting | Batch=16 on L4: 13.43x RT (0.4s/req), KV cache 2048→122 for call center text |
+| `23ba457` | /metrics endpoint + streaming format header | Prometheus-compatible metrics, atomic counters, x-audio-format header |
 
 ### Failed experiments
 
@@ -187,15 +188,15 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
 5. ~~**Streaming worker is single-threaded**~~ ✅ `31acfab` — Now batches up to 8 concurrent streams with forwarding threads per request.
 
-6. **WAV header data length** — Streaming sends `0xFFFFFFFF` as data length. Some players may not handle this. Consider sending correct length after generation or using raw PCM with content-length.
+6. ~~**WAV header data length**~~ ✅ `23ba457` — Added `x-audio-format: pcm-s16le-24000-mono` header. WAV `0xFFFFFFFF` is standard for streaming.
 
-7. **Error propagation in streaming** — Errors during `session.next_chunk()` are silently dropped. Should send error through channel.
+7. ~~**Error propagation in streaming**~~ ✅ Already handled — `synthesize_batch_streaming` errors sent to all clients, forwarding threads terminate on sender drop.
 
 ### P2 — Nice to have
 
 8. **GGUF quantized models** — The `qts` project (also in workspace) supports GGUF quantized Qwen3-TTS. Could reduce VRAM significantly but needs vocoder ONNX integration.
 
-9. **Metrics endpoint** — Prometheus metrics: requests/sec, batch utilization, RTF histogram, VRAM usage, queue depth.
+9. ~~**Metrics endpoint**~~ ✅ `23ba457` — `GET /metrics` with Prometheus text format: requests_total, streaming, errors, audio_seconds, gen_seconds, avg_rtf, queue_depth. Atomic counters, no external deps.
 
 10. **WebSocket streaming** — Current streaming uses HTTP chunked transfer. WebSocket would allow bidirectional control (cancel, pause).
 

@@ -1,8 +1,39 @@
+# Build artifacts
 /target
+*.d
+
+# Model weights (download separately)
 models/
+
+# Audio files
 *.wav
+*.mp3
+
+# GGUF/ONNX model files
 *.gguf
 *.onnx
-__pycache__/
+
+# Compiled binaries (downloaded from Modal)
 *-flash
+qwen3-tts-server-flash
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Deployment (contains secrets/IPs)
 REMOTE.md
+
+# Logs
+*.log

@@ -30,9 +30,8 @@ with batched inference, streaming, and voice cloning for call center workloads.
 
 | Path | Description |
 |------|-------------|
-| `server/src/main.rs` | Axum server, routes, WAV encoding, streaming response |
+| `server/src/main.rs` | Axum server, routes, WAV encoding, streaming response, batched streaming worker |
 | `server/src/batch.rs` | `BatchEngine` — collects requests, runs batched forward pass |
-| `server/src/streaming.rs` | Batched streaming stub (currently non-incremental) |
 | `server/src/bin/bench_batch.rs` | Batch throughput benchmark (1/2/4/8 + sequential baseline + TTFA) |
 | `server/src/bin/bench_stream.rs` | Streaming latency benchmark |
 | `server/src/bin/bench_n.rs` | Concurrent HTTP benchmark |

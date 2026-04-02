@@ -5,3 +5,4 @@ models/
 *.onnx
 __pycache__/
 *-flash
+REMOTE.md

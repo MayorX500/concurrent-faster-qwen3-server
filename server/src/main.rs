@@ -1,5 +1,4 @@
 mod batch;
-mod streaming;
 
 use anyhow::Result;
 use axum::{
@@ -187,7 +186,6 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
 }
 
 async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Response {
-    let model_dir = state.model_dir.clone();
     let language = parse_language(&req.language);
     let text = req.text.clone();
 
@@ -208,7 +206,7 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
         .header("transfer-encoding", "chunked")
         .header("x-audio-format", "pcm-s16le-24000-mono")
         .body(body)
-        .unwrap()
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
 }
 
 struct StreamingRequest {
@@ -228,7 +226,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
         loop {
             // Block on first request
             let first = {
-                let mut guard = rx.lock().unwrap();
+                let mut guard = rx.lock().expect("streaming worker mutex poisoned");
                 match guard.blocking_recv() {
                     Some(r) => r,
                     None => break,
@@ -240,7 +238,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             loop {
                 if batch.len() >= 8 { break; }
-                let mut guard = rx.lock().unwrap();
+                let mut guard = rx.lock().expect("streaming worker mutex poisoned");
                 match guard.try_recv() {
                     Ok(r) => { batch.push(r); }
                     Err(_) => {
@@ -295,7 +293,7 @@ fn decode_ref_audio(req: &SpeechRequest) -> Option<VoiceCloneData> {
     req.ref_audio.as_ref().and_then(|b64| {
         base64::engine::general_purpose::STANDARD.decode(b64).ok().map(|bytes| {
             let tmp = std::env::temp_dir().join(format!("ref_{}.wav",
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
             std::fs::write(&tmp, &bytes).ok();
             VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone() }
         })

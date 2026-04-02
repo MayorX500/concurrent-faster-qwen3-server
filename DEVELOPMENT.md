@@ -172,7 +172,22 @@ modal run modal_flash_batch.py
 
 Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
-## Pending Work
+## Pending Work — Performance
+
+### High Priority
+
+| Issue | Title | Expected Impact |
+|-------|-------|-----------------|
+| [#1](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/1) | Speculative decoding for single-stream | Batch=1: 2.6s → ~1.5-1.8s (35-40% reduction) |
+| [#2](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/2) | Batched vocoder decoding (Phase 4) | Batch=16: ~200-400ms saved |
+
+### Medium Priority
+
+| Issue | Title | Expected Impact |
+|-------|-------|-----------------|
+| [#3](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/3) | Batched prefill embedding (Phase 1) | Batch=16: ~100-200ms saved |
+
+## Pending Work — Features
 
 ### P0 — Critical for production
 

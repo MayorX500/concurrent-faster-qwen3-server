@@ -1028,23 +1028,26 @@ impl Qwen3TTS {
         let audio = if let Some(ref_codes) = &prompt.ref_codes {
             let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
             let ref_len = ref_frames.len();
-            let mut combined = ref_frames;
-            combined.extend(all_codes.iter().cloned());
 
-            let mut audio = self.decode_codes(&combined)?;
-            let total_frames = combined.len();
-            // Proportional cut: matches official Qwen3-TTS Python implementation
-            // cut = ref_len / total_len * wav.shape[0]
-            let cut_samples = ref_len * audio.len() / total_frames.max(1);
-            tracing::debug!(
-                "ICL decode: ref_frames={}, gen_frames={}, total_samples={}, cut_samples={}",
-                ref_len,
-                all_codes.len(),
-                audio.len(),
-                cut_samples,
-            );
-            audio.samples = audio.samples[cut_samples.min(audio.len())..].to_vec();
-            audio
+            if all_codes.is_empty() {
+                AudioBuffer::new(vec![], 24000)
+            } else {
+                // Decode ref+gen together (vocoder needs context), then cut ref portion.
+                // Use two-pass approach: decode ref alone to get exact ref sample count.
+                let ref_audio = self.decode_codes(&ref_frames)?;
+                let ref_samples = ref_audio.len();
+
+                let mut combined = ref_frames;
+                combined.extend(all_codes.iter().cloned());
+                let mut audio = self.decode_codes(&combined)?;
+
+                tracing::debug!(
+                    "ICL decode: ref_frames={}, gen_frames={}, ref_samples={}, total_samples={}",
+                    ref_len, all_codes.len(), ref_samples, audio.len(),
+                );
+                audio.samples = audio.samples[ref_samples.min(audio.len())..].to_vec();
+                audio
+            }
         } else {
             self.decode_codes(&all_codes)?
         };

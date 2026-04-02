@@ -1092,84 +1092,64 @@ impl Qwen3TTS {
         let opts0 = requests[0].2.clone().unwrap_or_default();
         let gen_config = opts0.to_gen_config();
 
-        // Phase 1: Build prefill embeddings for each sequence (CPU-side prep)
+        // Phase 1: Build prefill embeddings for each sequence
+        // Pre-compute shared tensors once (identical across all requests)
+        let role_prefix = self.talker.build_role_prefix_pub()?;
+        let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
+
+        // Pre-compute Serena codec embeddings (reused for non-voice-clone requests)
+        let serena_codec_ids_base = Tensor::new(
+            &[
+                codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS,
+                0u32, // placeholder for language — filled per request
+                codec_tokens::CODEC_THINK_EOS, Speaker::Serena.token_id(),
+                codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS,
+            ],
+            &self.device,
+        )?;
+        // Voice clone prefix tokens (without speaker)
+        let vc_prefix_ids = Tensor::new(
+            &[codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS, 0u32, codec_tokens::CODEC_THINK_EOS],
+            &self.device,
+        )?;
+        let vc_suffix_ids = Tensor::new(
+            &[codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
+            &self.device,
+        )?;
+        let vc_suffix_embed = self.talker.codec_embedding_forward(&vc_suffix_ids)?.unsqueeze(0)?;
+
         let mut prefill_embeds: Vec<Tensor> = Vec::with_capacity(n);
         let mut all_input_ids: Vec<Vec<u32>> = Vec::with_capacity(n);
 
         for (idx, (text, lang, _opts)) in requests.iter().enumerate() {
             let input_ids = self.text_tokenizer.encode(text)?;
 
-            let role_prefix = self.talker.build_role_prefix_pub()?;
-
-            let codec_hidden = if let Some(prompt) = voice_prompts.get(idx).and_then(|p| *p) {
-                // Voice clone: use speaker embedding tensor instead of Serena token
-                let codec_prefix_ids = Tensor::new(
-                    &[
-                        codec_tokens::CODEC_THINK,
-                        codec_tokens::CODEC_THINK_BOS,
-                        lang.token_id(),
-                        codec_tokens::CODEC_THINK_EOS,
-                    ],
-                    &self.device,
-                )?;
-                let codec_prefix_embed = self.talker.codec_embedding_forward(&codec_prefix_ids)?.unsqueeze(0)?;
+            let (codec_hidden, codec_bos_embed) = if let Some(prompt) = voice_prompts.get(idx).and_then(|p| *p) {
+                // Voice clone path
+                let mut pids: Vec<u32> = vc_prefix_ids.to_vec1()?;
+                pids[2] = lang.token_id();
+                let prefix_ids = Tensor::new(pids.as_slice(), &self.device)?;
+                let prefix_embed = self.talker.codec_embedding_forward(&prefix_ids)?.unsqueeze(0)?;
                 let speaker = prompt.speaker_embedding.to_dtype(self.compute_dtype)?
                     .reshape((1, 1, self.talker.config().hidden_size))?;
-                let codec_suffix_ids = Tensor::new(
-                    &[codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
-                    &self.device,
-                )?;
-                let codec_suffix_embed = self.talker.codec_embedding_forward(&codec_suffix_ids)?.unsqueeze(0)?;
-                let codec_embed = Tensor::cat(&[&codec_prefix_embed, &speaker, &codec_suffix_embed], 1)?;
-                let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
+                let codec_embed = Tensor::cat(&[&prefix_embed, &speaker, &vc_suffix_embed], 1)?;
                 let codec_first6 = codec_embed.i((.., ..6, ..))?;
                 let ch = tts_text_embed.add(&codec_first6)?;
-
-                let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
-                let mut hidden = Tensor::cat(&[&role_prefix, &ch], 1)?;
-                if let Some(combined) = self.talker.build_first_text_combined_pub(&input_ids, &codec_bos_embed)? {
-                    hidden = Tensor::cat(&[&hidden, &combined], 1)?;
-                }
-                prefill_embeds.push(hidden);
-                all_input_ids.push(input_ids);
-                continue;
+                let bos = codec_embed.i((.., 6..7, ..))?;
+                (ch, bos)
             } else {
-                // Default Serena voice
-                let codec_ids = Tensor::new(
-                    &[
-                        codec_tokens::CODEC_THINK,
-                        codec_tokens::CODEC_THINK_BOS,
-                        lang.token_id(),
-                        codec_tokens::CODEC_THINK_EOS,
-                        Speaker::Serena.token_id(),
-                        codec_tokens::CODEC_PAD,
-                        codec_tokens::CODEC_BOS,
-                    ],
-                    &self.device,
-                )?;
+                // Serena path — only recompute language token
+                let mut ids: Vec<u32> = serena_codec_ids_base.to_vec1()?;
+                ids[2] = lang.token_id();
+                let codec_ids = Tensor::new(ids.as_slice(), &self.device)?;
                 let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
-                let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
                 let codec_first6 = codec_embed.i((.., ..6, ..))?;
-                tts_text_embed.add(&codec_first6)?
+                let ch = tts_text_embed.add(&codec_first6)?;
+                let bos = codec_embed.i((.., 6..7, ..))?;
+                (ch, bos)
             };
 
             let mut hidden = Tensor::cat(&[&role_prefix, &codec_hidden], 1)?;
-
-            // First text token + codec_bos
-            let codec_ids = Tensor::new(
-                &[
-                    codec_tokens::CODEC_THINK,
-                    codec_tokens::CODEC_THINK_BOS,
-                    lang.token_id(),
-                    codec_tokens::CODEC_THINK_EOS,
-                    Speaker::Serena.token_id(),
-                    codec_tokens::CODEC_PAD,
-                    codec_tokens::CODEC_BOS,
-                ],
-                &self.device,
-            )?;
-            let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
-            let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
             if let Some(combined) = self.talker.build_first_text_combined_pub(&input_ids, &codec_bos_embed)? {
                 hidden = Tensor::cat(&[&hidden, &combined], 1)?;
             }

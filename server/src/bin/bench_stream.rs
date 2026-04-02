@@ -10,8 +10,8 @@ fn main() {
     println!("Warmup done");
 
     for n in [2, 4, 8] {
-        let requests: Vec<(String, Language)> = (0..n)
-            .map(|i| (format!("Buenos días, le habla el asistente número {}. ¿En qué puedo ayudarle?", i+1), Language::Spanish))
+        let requests: Vec<(String, Language, Option<qwen3_tts::SynthesisOptions>)> = (0..n)
+            .map(|i| (format!("Buenos días, le habla el asistente número {}. ¿En qué puedo ayudarle?", i+1), Language::Spanish, None))
             .collect();
 
         let mut senders = Vec::new();

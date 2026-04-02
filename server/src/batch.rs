@@ -25,6 +25,14 @@ pub struct VoiceCloneData {
     pub ref_text: Option<String>,
 }
 
+impl Drop for VoiceCloneData {
+    fn drop(&mut self) {
+        if self.ref_audio_path.exists() {
+            let _ = std::fs::remove_file(&self.ref_audio_path);
+        }
+    }
+}
+
 pub struct BatchResult {
     pub audio: AudioBuffer,
     pub gen_time_secs: f32,
@@ -113,8 +121,13 @@ impl BatchEngine {
                     .iter()
                     .map(|r| {
                         r.voice_clone.as_ref().and_then(|vc| {
-                            let ref_buf = qwen3_tts::AudioBuffer::load(&vc.ref_audio_path).ok()?;
-                            model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()).ok()
+                            match qwen3_tts::AudioBuffer::load(&vc.ref_audio_path) {
+                                Ok(ref_buf) => match model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()) {
+                                    Ok(prompt) => Some(prompt),
+                                    Err(e) => { warn!("Voice clone prompt failed: {e:#}"); None }
+                                },
+                                Err(e) => { warn!("Voice clone ref_audio load failed: {e:#}"); None }
+                            }
                         })
                     })
                     .collect();

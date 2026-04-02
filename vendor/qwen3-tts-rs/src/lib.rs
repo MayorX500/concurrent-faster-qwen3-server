@@ -1245,8 +1245,6 @@ impl Qwen3TTS {
         // Pre-allocate zero tensor for done sequences (avoid per-frame allocation)
         let zero_input = Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?;
 
-        let mut cp_kv_caches: Vec<Vec<models::transformer::AnyKVCache>> =
-            (0..n).map(|_| self.code_predictor.new_kv_caches()).collect();
         let mut offset = max_prefill_len;
 
         for frame_idx in 0..gen_config.max_new_tokens {
@@ -1444,15 +1442,12 @@ impl Qwen3TTS {
     /// then the channel is dropped when generation completes.
     pub fn synthesize_batch_streaming(
         &self,
-        requests: &[(String, Language)],
+        requests: &[(String, Language, Option<SynthesisOptions>)],
         senders: &[std::sync::mpsc::Sender<AudioBuffer>],
         chunk_frames: usize,
     ) -> Result<()> {
         let n = requests.len();
-        let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests
-            .iter()
-            .map(|(t, l)| (t.clone(), *l, None))
-            .collect();
+        let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests.to_vec();
 
         // Reuse the batch setup from synthesize_batch
         let opts0 = SynthesisOptions::default();

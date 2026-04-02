@@ -42,8 +42,8 @@ struct AppState {
     tx: mpsc::Sender<BatchRequest>,
     stream_tx: mpsc::Sender<StreamingRequest>,
     semaphore: Arc<Semaphore>,
+    max_inflight: usize,
     max_batch: usize,
-    model_dir: String,
     metrics: Arc<Metrics>,
 }
 
@@ -116,7 +116,7 @@ fn wav_header(sample_rate: u32, data_len: u32) -> Vec<u8> {
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let queue = state.max_batch - state.semaphore.available_permits();
+    let queue = state.max_inflight.saturating_sub(state.semaphore.available_permits());
     Json(HealthResponse { status: "ok", queue_depth: queue, max_batch: state.max_batch })
 }
 
@@ -137,7 +137,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
         m.requests_streaming.load(Ordering::Relaxed),
         m.errors_total.load(Ordering::Relaxed),
         audio_s, gen_s, avg_rtf,
-        state.max_batch - state.semaphore.available_permits(),
+        state.max_inflight.saturating_sub(state.semaphore.available_permits()),
     )
 }
 
@@ -252,8 +252,10 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
             let n = batch.len();
             info!(batch_size = n, "Streaming batch");
 
-            let requests: Vec<(String, qwen3_tts::Language)> = batch.iter()
-                .map(|r| (r.text.clone(), r.language)).collect();
+            let requests: Vec<(String, qwen3_tts::Language, Option<qwen3_tts::SynthesisOptions>)> = batch.iter()
+                .map(|r| (r.text.clone(), r.language,
+                    Some(qwen3_tts::SynthesisOptions { temperature: r.temperature, ..Default::default() })
+                )).collect();
             let (senders, receivers): (Vec<_>, Vec<_>) = (0..n)
                 .map(|_| std::sync::mpsc::channel::<qwen3_tts::AudioBuffer>()).unzip();
 
@@ -325,7 +327,7 @@ async fn main() -> Result<()> {
     let max_inflight = max_batch * 2;
 
     let state = Arc::new(AppState {
-        tx, stream_tx, semaphore: Arc::new(Semaphore::new(max_inflight)), max_batch, model_dir,
+        tx, stream_tx, semaphore: Arc::new(Semaphore::new(max_inflight)), max_inflight, max_batch,
         metrics: Arc::new(Metrics::new()),
     });
 

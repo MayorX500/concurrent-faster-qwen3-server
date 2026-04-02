@@ -211,43 +211,32 @@ modal run modal_test.py             # run unit tests
 
 ## Benchmarking
 
-All benchmarks run on Modal with real GPU instances:
+Scripts in `scripts/` for benchmarking against a running server:
 
 ```bash
-# Batch throughput benchmark (1/2/4/8/16 concurrent requests)
-modal run modal_flash_batch.py
+# Batch throughput + concurrent latency (1/2/4/8/16 requests)
+python3 scripts/bench_server.py --url http://localhost:8090
 
-# Detailed profiling (per-phase timing: prefill, generation, decode)
-modal run modal_profile.py
+# Voice cloning (x_vector mode)
+python3 scripts/bench_voice_clone.py --ref reference.wav --output cloned.wav
 
-# Run unit tests
-modal run modal_test.py
+# Voice cloning (ICL mode — higher quality)
+python3 scripts/bench_voice_clone.py --ref reference.wav --ref-text "Transcript of reference." --output cloned_icl.wav
+
+# Streaming TTFA (time to first audio)
+python3 scripts/bench_streaming.py --url http://localhost:8090 --trials 5
+
+# Custom concurrency levels
+python3 scripts/bench_server.py --concurrency 1,4,8,16,32
 ```
 
-Local benchmark with `curl` (server must be running):
+Build and benchmark on Modal (remote GPU):
 
 ```bash
-# Single request latency
-time curl -s -X POST http://localhost:8090/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Buenos días, le habla el asistente virtual del centro de atención.", "language": "spanish"}' \
-  --output /dev/null -w "HTTP %{http_code}, %{time_total}s\n"
-
-# Concurrent requests (requires GNU parallel)
-seq 8 | parallel -j8 'curl -s -X POST http://localhost:8090/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d "{\"text\": \"Asistente número {}. ¿En qué puedo ayudarle?\", \"language\": \"spanish\"}" \
-  --output /tmp/out_{}.wav -w "req {}: %{time_total}s\n"'
-
-# Voice cloning latency
-REF_B64=$(base64 -w0 reference.wav)
-time curl -s -X POST http://localhost:8090/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d "{\"text\": \"Prueba de clonación\", \"language\": \"spanish\", \"ref_audio\": \"$REF_B64\", \"ref_text\": \"Transcripción del audio de referencia.\"}" \
-  --output clone_test.wav
-
-# Check metrics after load test
-curl -s http://localhost:8090/metrics
+modal run modal_compile.py          # compile on H100 (targets L4 sm_89)
+modal run modal_flash_batch.py      # batch throughput on L4
+modal run modal_profile.py          # per-phase profiling on L4
+modal run modal_test.py             # unit tests
 ```
 
 ## Architecture

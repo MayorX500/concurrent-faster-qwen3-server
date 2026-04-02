@@ -205,13 +205,11 @@ Requires Modal account for H100 cross-compilation:
 
 ```bash
 modal run modal_compile.py          # compile on H100 (targets L4 sm_89)
-modal run modal_flash_batch.py      # benchmark on L4
-modal run modal_test.py             # run unit tests
 ```
 
 ## Benchmarking
 
-Scripts in `scripts/` for benchmarking against a running server:
+Scripts in `scripts/` for benchmarking against a running server (no Modal needed):
 
 ```bash
 # Batch throughput + concurrent latency (1/2/4/8/16 requests)
@@ -230,13 +228,12 @@ python3 scripts/bench_streaming.py --url http://localhost:8090 --trials 5
 python3 scripts/bench_server.py --concurrency 1,4,8,16,32
 ```
 
-Build and benchmark on Modal (remote GPU):
+Remote benchmarks on Modal (optional, for profiling on cloud GPUs):
 
 ```bash
-modal run modal_compile.py          # compile on H100 (targets L4 sm_89)
 modal run modal_flash_batch.py      # batch throughput on L4
 modal run modal_profile.py          # per-phase profiling on L4
-modal run modal_test.py             # unit tests
+modal run modal_test.py             # unit tests on L4
 ```
 
 ## Architecture

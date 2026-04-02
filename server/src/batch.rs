@@ -98,7 +98,14 @@ impl BatchEngine {
                 // Try batched forward pass (all sequences in one GPU pass)
                 let requests: Vec<(String, qwen3_tts::Language, Option<SynthesisOptions>)> = batch
                     .iter()
-                    .map(|r| (r.text.clone(), r.language, Some(r.options.clone())))
+                    .map(|r| {
+                        // Adaptive max_length: ~6 frames per word, capped at 512 for call center
+                        let word_count = r.text.split_whitespace().count();
+                        let adaptive_max = ((word_count * 6) + 50).min(512).max(100);
+                        let mut opts = r.options.clone();
+                        opts.max_length = adaptive_max;
+                        (r.text.clone(), r.language, Some(opts))
+                    })
                     .collect();
 
                 // Build per-request voice clone prompts
@@ -130,6 +137,39 @@ impl BatchEngine {
                         continue;
                     }
                     Err(e) => {
+                        let err_msg = format!("{e:#}");
+                        if err_msg.contains("out of memory") || err_msg.contains("OOM") {
+                            // OOM: split batch in half and retry
+                            let mid = batch.len() / 2;
+                            warn!(batch_size, mid, "OOM in batch, splitting and retrying");
+                            let second_half: Vec<BatchRequest> = batch.drain(mid..).collect();
+                            // Re-queue second half by processing after first half
+                            // Process first half sequentially (safe)
+                            for req in batch {
+                                let t_req = Instant::now();
+                                let result = Self::process_single(&model, &req);
+                                let gen_time = t_req.elapsed().as_secs_f32();
+                                let reply = match result {
+                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
+                                    Err(e) => Err(e),
+                                };
+                                let _ = req.reply.send(reply);
+                            }
+                            // Process second half sequentially
+                            for req in second_half {
+                                let t_req = Instant::now();
+                                let result = Self::process_single(&model, &req);
+                                let gen_time = t_req.elapsed().as_secs_f32();
+                                let reply = match result {
+                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
+                                    Err(e) => Err(e),
+                                };
+                                let _ = req.reply.send(reply);
+                            }
+                            let total = t0.elapsed().as_secs_f32();
+                            info!(total_secs = total, "OOM recovery complete (sequential fallback)");
+                            continue;
+                        }
                         warn!("Batched forward failed: {e:#}, falling back to sequential");
                     }
                 }

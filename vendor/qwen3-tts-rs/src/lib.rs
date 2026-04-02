@@ -172,6 +172,12 @@ pub struct Qwen3TTS {
     compute_dtype: DType,
 }
 
+// SAFETY: Qwen3TTS weights are read-only after construction.
+// All mutable state (KV caches) is allocated per-request as local variables.
+// CUDA operations serialize on the GPU stream, so concurrent &self calls are safe.
+unsafe impl Send for Qwen3TTS {}
+unsafe impl Sync for Qwen3TTS {}
+
 impl Qwen3TTS {
     /// Load a model from a HuggingFace model ID or local path.
     ///
@@ -1058,11 +1064,26 @@ impl Qwen3TTS {
         &self,
         requests: &[(String, Language, Option<SynthesisOptions>)],
     ) -> Result<Vec<AudioBuffer>> {
+        let prompts: Vec<Option<&VoiceClonePrompt>> = vec![None; requests.len()];
+        self.synthesize_batch_with_voices(requests, &prompts)
+    }
+
+    /// Batched synthesis with optional per-request voice clone prompts.
+    /// When `voice_prompts[i]` is `Some`, uses that speaker embedding;
+    /// when `None`, uses the default Serena voice.
+    pub fn synthesize_batch_with_voices(
+        &self,
+        requests: &[(String, Language, Option<SynthesisOptions>)],
+        voice_prompts: &[Option<&VoiceClonePrompt>],
+    ) -> Result<Vec<AudioBuffer>> {
         if requests.is_empty() {
             return Ok(vec![]);
         }
         if requests.len() == 1 {
             let (text, lang, opts) = &requests[0];
+            if let Some(prompt) = voice_prompts.first().and_then(|p| *p) {
+                return Ok(vec![self.synthesize_voice_clone(text, prompt, *lang, opts.clone())?]);
+            }
             let audio = self.synthesize_with_voice(text, Speaker::Serena, *lang, opts.clone())?;
             return Ok(vec![audio]);
         }
@@ -1071,37 +1092,64 @@ impl Qwen3TTS {
         let opts0 = requests[0].2.clone().unwrap_or_default();
         let gen_config = opts0.to_gen_config();
 
-        // Phase 1: Build prefill embeddings for each sequence (CPU-side prep)
+        // Phase 1: Build prefill embeddings for each sequence
+        // Pre-compute shared tensors once (identical across all requests)
+        let role_prefix = self.talker.build_role_prefix_pub()?;
+        let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
+
+        // Pre-compute Serena codec embeddings (reused for non-voice-clone requests)
+        let serena_codec_ids_base = Tensor::new(
+            &[
+                codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS,
+                0u32, // placeholder for language — filled per request
+                codec_tokens::CODEC_THINK_EOS, Speaker::Serena.token_id(),
+                codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS,
+            ],
+            &self.device,
+        )?;
+        // Voice clone prefix tokens (without speaker)
+        let vc_prefix_ids = Tensor::new(
+            &[codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS, 0u32, codec_tokens::CODEC_THINK_EOS],
+            &self.device,
+        )?;
+        let vc_suffix_ids = Tensor::new(
+            &[codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
+            &self.device,
+        )?;
+        let vc_suffix_embed = self.talker.codec_embedding_forward(&vc_suffix_ids)?.unsqueeze(0)?;
+
         let mut prefill_embeds: Vec<Tensor> = Vec::with_capacity(n);
         let mut all_input_ids: Vec<Vec<u32>> = Vec::with_capacity(n);
 
-        for (text, lang, _opts) in requests {
+        for (idx, (text, lang, _opts)) in requests.iter().enumerate() {
             let input_ids = self.text_tokenizer.encode(text)?;
 
-            // Build the same embedding sequence as prefill_custom_voice
-            let role_prefix = self.talker.build_role_prefix_pub()?;
-
-            let codec_ids = Tensor::new(
-                &[
-                    codec_tokens::CODEC_THINK,
-                    codec_tokens::CODEC_THINK_BOS,
-                    lang.token_id(),
-                    codec_tokens::CODEC_THINK_EOS,
-                    Speaker::Serena.token_id(),
-                    codec_tokens::CODEC_PAD,
-                    codec_tokens::CODEC_BOS,
-                ],
-                &self.device,
-            )?;
-            let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
-            let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
-            let codec_first6 = codec_embed.i((.., ..6, ..))?;
-            let codec_hidden = tts_text_embed.add(&codec_first6)?;
+            let (codec_hidden, codec_bos_embed) = if let Some(prompt) = voice_prompts.get(idx).and_then(|p| *p) {
+                // Voice clone path
+                let mut pids: Vec<u32> = vc_prefix_ids.to_vec1()?;
+                pids[2] = lang.token_id();
+                let prefix_ids = Tensor::new(pids.as_slice(), &self.device)?;
+                let prefix_embed = self.talker.codec_embedding_forward(&prefix_ids)?.unsqueeze(0)?;
+                let speaker = prompt.speaker_embedding.to_dtype(self.compute_dtype)?
+                    .reshape((1, 1, self.talker.config().hidden_size))?;
+                let codec_embed = Tensor::cat(&[&prefix_embed, &speaker, &vc_suffix_embed], 1)?;
+                let codec_first6 = codec_embed.i((.., ..6, ..))?;
+                let ch = tts_text_embed.add(&codec_first6)?;
+                let bos = codec_embed.i((.., 6..7, ..))?;
+                (ch, bos)
+            } else {
+                // Serena path — only recompute language token
+                let mut ids: Vec<u32> = serena_codec_ids_base.to_vec1()?;
+                ids[2] = lang.token_id();
+                let codec_ids = Tensor::new(ids.as_slice(), &self.device)?;
+                let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
+                let codec_first6 = codec_embed.i((.., ..6, ..))?;
+                let ch = tts_text_embed.add(&codec_first6)?;
+                let bos = codec_embed.i((.., 6..7, ..))?;
+                (ch, bos)
+            };
 
             let mut hidden = Tensor::cat(&[&role_prefix, &codec_hidden], 1)?;
-
-            // First text token + codec_bos
-            let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
             if let Some(combined) = self.talker.build_first_text_combined_pub(&input_ids, &codec_bos_embed)? {
                 hidden = Tensor::cat(&[&hidden, &combined], 1)?;
             }
@@ -1170,12 +1218,6 @@ impl Qwen3TTS {
 
         let mut all_codes: Vec<FrameCodes> = (0..n).map(|_| Vec::new()).collect();
         let mut done: Vec<bool> = vec![false; n];
-        let mut penalty_masks: Vec<Tensor> = (0..n)
-            .map(|_| Tensor::zeros((1, codec_tokens::CODEC_VOCAB_SIZE), DType::F32, &self.device))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut sampling_ctxs: Vec<generation::SamplingContext> = (0..n)
-            .map(|_| generation::SamplingContext::new(None))
-            .collect();
 
         // Build trailing text for each sequence
         let mut all_trailing: Vec<Tensor> = Vec::with_capacity(n);
@@ -1187,23 +1229,22 @@ impl Qwen3TTS {
             all_trailing_len.push(tlen);
         }
 
-        // Sample initial tokens
+        // Batched initial token sampling (same greedy path as main loop)
+        let init_logits = Tensor::cat(&last_logits, 0)?.squeeze(1)?.to_dtype(candle_core::DType::F32)?;
+        let init_suppressed = generation::apply_token_suppression_with_mask(&init_logits, &suppression_mask)?;
+        let init_tokens = init_suppressed.argmax(candle_core::D::Minus1)?;
+        let init_ids: Vec<u32> = init_tokens.flatten_all()?.to_vec1()?;
+
         let mut semantic_tokens: Vec<Tensor> = Vec::with_capacity(n);
         let mut semantic_ids: Vec<u32> = Vec::with_capacity(n);
         for i in 0..n {
-            let logits_2d = last_logits[i].squeeze(1)?;
-            let logits_2d = self.apply_generation_penalties_gpu(
-                &logits_2d, &penalty_masks[i], &gen_config, 0, Some(&suppression_mask),
-            )?;
-            let tok = generation::sample(&logits_2d, &gen_config, &mut sampling_ctxs[i])?;
-            let id: u32 = tok.flatten_all()?.to_vec1::<u32>()?[0];
-            Self::update_penalty_mask(&mut penalty_masks[i], id, codec_tokens::CODEC_VOCAB_SIZE)?;
-            semantic_tokens.push(tok);
-            semantic_ids.push(id);
+            semantic_tokens.push(init_tokens.i(i)?);
+            semantic_ids.push(init_ids[i]);
         }
 
-        let mut cp_kv_caches: Vec<Vec<models::transformer::AnyKVCache>> =
-            (0..n).map(|_| self.code_predictor.new_kv_caches()).collect();
+        // Pre-allocate zero tensor for done sequences (avoid per-frame allocation)
+        let zero_input = Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?;
+
         let mut offset = max_prefill_len;
 
         for frame_idx in 0..gen_config.max_new_tokens {
@@ -1220,14 +1261,13 @@ impl Qwen3TTS {
             // BATCHED code predictor: all active sequences in one pass
             let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
 
-            // Stack semantic embeddings for active sequences
+            // Semantic embedding lookup per active sequence
             let active_semantic_embeds: Vec<Tensor> = active.iter()
                 .map(|&i| self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i]))
                 .collect::<Result<Vec<_>>>()?;
             let active_hiddens: Vec<Tensor> = active.iter()
                 .map(|&i| last_hiddens[i].clone())
                 .collect();
-
             let batched_hiddens = Tensor::cat(&active_hiddens, 0)?;
             let batched_sem_embeds = Tensor::cat(&active_semantic_embeds, 0)?;
 
@@ -1242,12 +1282,12 @@ impl Qwen3TTS {
             let mut gpu_frames: Vec<Option<Tensor>> = vec![None; n];
             for i in 0..n {
                 if done[i] {
-                    step_inputs.push(Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?);
+                    step_inputs.push(zero_input.clone());
                     continue;
                 }
 
                 let acoustic_codes = &batched_acoustic[active_idx];
-                let semantic_embed = &active_semantic_embeds[active_idx];
+                let semantic_embed_i = &active_semantic_embeds[active_idx];
                 active_idx += 1;
 
                 // Keep frame on GPU — defer to_vec1 to end
@@ -1255,7 +1295,7 @@ impl Qwen3TTS {
                 gpu_frames[i] = Some(frame_tensor);
 
                 let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(acoustic_codes)?;
-                let summed = semantic_embed.add(&acoustic_sum)?;
+                let summed = semantic_embed_i.add(&acoustic_sum)?;
 
                 let text_addition = if frame_idx < all_trailing_len[i] {
                     all_trailing[i].i((.., frame_idx..frame_idx + 1, ..))?
@@ -1283,21 +1323,17 @@ impl Qwen3TTS {
             batched_hidden = self.talker.apply_norm(&batched_hidden)?;
             let batched_logits = self.talker.apply_codec_head(&batched_hidden)?;
 
-            // Sample per sequence (penalties are per-sequence so can't fully batch)
+            // Batched greedy sampling: apply suppression + argmax in one pass
+            let logits_2d = batched_logits.squeeze(1)?.to_dtype(candle_core::DType::F32)?; // [N, vocab]
+            let suppressed = generation::apply_token_suppression_with_mask(&logits_2d, &suppression_mask)?;
+            let all_new_tokens = suppressed.argmax(candle_core::D::Minus1)?; // [N]
+
+            // Update per-sequence state
             let mut new_tokens: Vec<Tensor> = Vec::with_capacity(n);
             for i in 0..n {
-                if done[i] {
-                    new_tokens.push(semantic_tokens[i].clone());
-                    continue;
-                }
+                let tok = all_new_tokens.i(i)?;
+                new_tokens.push(tok.clone());
                 last_hiddens[i] = batched_hidden.i(i..i + 1)?;
-                let logits_i = batched_logits.i(i..i + 1)?.squeeze(1)?;
-                let logits_i = self.apply_generation_penalties_gpu(
-                    &logits_i, &penalty_masks[i], &gen_config,
-                    frame_idx + 1, Some(&suppression_mask),
-                )?;
-                let tok = generation::sample(&logits_i, &gen_config, &mut sampling_ctxs[i])?;
-                new_tokens.push(tok);
             }
 
             // Batched EOS check: stack all tokens → single GPU→CPU transfer
@@ -1306,9 +1342,6 @@ impl Qwen3TTS {
             for i in 0..n {
                 semantic_tokens[i] = new_tokens[i].clone();
                 semantic_ids[i] = all_ids[i];
-                if !done[i] {
-                    Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
-                }
             }
 
             // Bulk transfer frame codes (single sync)
@@ -1334,13 +1367,40 @@ impl Qwen3TTS {
             }
         }
 
-        // Phase 4: Decode each sequence
-        let mut results = Vec::with_capacity(n);
-        for codes in &all_codes {
-            if codes.is_empty() {
-                results.push(AudioBuffer::new(vec![], 24000));
-            } else {
-                results.push(self.decode_codes(codes)?);
+        // Phase 4: Batched vocoder decode
+        let non_empty: Vec<(usize, &Vec<Vec<u32>>)> = all_codes.iter().enumerate()
+            .filter(|(_, c)| !c.is_empty()).collect();
+
+        let mut results: Vec<AudioBuffer> = (0..n).map(|_| AudioBuffer::new(vec![], 24000)).collect();
+
+        if non_empty.len() > 1 {
+            // Batch decode: pad to max frames, stack [N, 16, T_max], single vocoder pass
+            let max_frames = non_empty.iter().map(|(_, c)| c.len()).max().unwrap_or(0);
+            let frame_lens: Vec<usize> = non_empty.iter().map(|(_, c)| c.len()).collect();
+
+            let mut batch_data = vec![0i64; non_empty.len() * 16 * max_frames];
+            for (batch_idx, (_, codes)) in non_empty.iter().enumerate() {
+                for (frame, frame_codes) in codes.iter().enumerate() {
+                    for (q, &code) in frame_codes.iter().enumerate() {
+                        batch_data[batch_idx * 16 * max_frames + q * max_frames + frame] = code as i64;
+                    }
+                }
+            }
+            let batched_tensor = Tensor::from_vec(
+                batch_data, (non_empty.len(), 16, max_frames), &self.device,
+            )?;
+            let waveform = self.decoder.decode(&batched_tensor)?; // [N, 1, total_samples]
+            let samples_per_frame = 24000 / 12; // 2000 samples per frame at 24kHz/12Hz
+            for (batch_idx, (orig_idx, _)) in non_empty.iter().enumerate() {
+                let actual_samples = frame_lens[batch_idx] * samples_per_frame;
+                let wav_i = waveform.i(batch_idx)?.flatten_all()?;
+                let trim_len = actual_samples.min(wav_i.dim(0)?);
+                let trimmed = wav_i.narrow(0, 0, trim_len)?;
+                results[*orig_idx] = AudioBuffer::from_tensor(trimmed, 24000)?;
+            }
+        } else {
+            for (orig_idx, codes) in &non_empty {
+                results[*orig_idx] = self.decode_codes(codes)?;
             }
         }
         Ok(results)
@@ -1382,15 +1442,12 @@ impl Qwen3TTS {
     /// then the channel is dropped when generation completes.
     pub fn synthesize_batch_streaming(
         &self,
-        requests: &[(String, Language)],
+        requests: &[(String, Language, Option<SynthesisOptions>)],
         senders: &[std::sync::mpsc::Sender<AudioBuffer>],
         chunk_frames: usize,
     ) -> Result<()> {
         let n = requests.len();
-        let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests
-            .iter()
-            .map(|(t, l)| (t.clone(), *l, None))
-            .collect();
+        let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests.to_vec();
 
         // Reuse the batch setup from synthesize_batch
         let opts0 = SynthesisOptions::default();
@@ -1500,12 +1557,13 @@ impl Qwen3TTS {
             semantic_ids.push(id);
         }
 
-        let mut cp_kv_caches: Vec<Vec<models::transformer::AnyKVCache>> =
-            (0..n).map(|_| self.code_predictor.new_kv_caches()).collect();
         let mut offset = max_prefill_len;
 
         // Frame buffers for chunked decode
         let mut frame_buffers: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
+
+        // Pre-allocate zero tensor for done sequences
+        let zero_input = Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?;
 
         // Phase 3: Batched generation with streaming decode
         for frame_idx in 0..gen_config.max_new_tokens {
@@ -1518,22 +1576,39 @@ impl Qwen3TTS {
             }
             if done.iter().all(|&d| d) { break; }
 
+            // BATCHED code predictor: all active sequences in one pass
+            let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
+
+            let active_semantic_embeds: Vec<Tensor> = active.iter()
+                .map(|&i| self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i]))
+                .collect::<Result<Vec<_>>>()?;
+            let active_hiddens: Vec<Tensor> = active.iter()
+                .map(|&i| last_hiddens[i].clone()).collect();
+            let batched_hiddens = Tensor::cat(&active_hiddens, 0)?;
+            let batched_sem_embeds = Tensor::cat(&active_semantic_embeds, 0)?;
+
+            let batched_acoustic = self.code_predictor.generate_acoustic_codes_batched(
+                &batched_hiddens, &batched_sem_embeds,
+            )?;
+
             let mut step_inputs: Vec<Tensor> = Vec::with_capacity(n);
+            let mut active_idx = 0;
             for i in 0..n {
                 if done[i] {
-                    step_inputs.push(Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?);
+                    step_inputs.push(zero_input.clone());
                     continue;
                 }
-                let semantic_embed = self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i])?;
-                let acoustic_codes = self.code_predictor.generate_acoustic_codes(
-                    &last_hiddens[i], &semantic_embed, &mut cp_kv_caches[i],
-                )?;
-                let frame_tensor = Tensor::cat(&[&semantic_tokens[i].reshape(1)?, &acoustic_codes], 0)?;
+
+                let acoustic_codes = &batched_acoustic[active_idx];
+                let semantic_embed_i = &active_semantic_embeds[active_idx];
+                active_idx += 1;
+
+                let frame_tensor = Tensor::cat(&[&semantic_tokens[i].reshape(1)?, acoustic_codes], 0)?;
                 let frame_vec: Vec<u32> = frame_tensor.to_vec1()?;
                 frame_buffers[i].push(frame_vec);
 
-                let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(&acoustic_codes)?;
-                let summed = semantic_embed.add(&acoustic_sum)?;
+                let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(acoustic_codes)?;
+                let summed = semantic_embed_i.add(&acoustic_sum)?;
                 let text_addition = if frame_idx < all_trailing_len[i] {
                     all_trailing[i].i((.., frame_idx..frame_idx + 1, ..))?
                 } else { tts_pad_embed.clone() };

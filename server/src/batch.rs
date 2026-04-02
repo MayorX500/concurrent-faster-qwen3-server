@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, SynthesisOptions};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -24,6 +25,14 @@ pub struct VoiceCloneData {
     pub ref_text: Option<String>,
 }
 
+impl Drop for VoiceCloneData {
+    fn drop(&mut self) {
+        if self.ref_audio_path.exists() {
+            let _ = std::fs::remove_file(&self.ref_audio_path);
+        }
+    }
+}
+
 pub struct BatchResult {
     pub audio: AudioBuffer,
     pub gen_time_secs: f32,
@@ -35,8 +44,6 @@ pub struct BatchEngineConfig {
     pub max_batch_size: usize,
     /// Maximum time to wait for a full batch before processing partial batch (ms)
     pub max_wait_ms: u64,
-    /// Model directory path
-    pub model_dir: String,
 }
 
 /// The batch engine runs on a dedicated thread, collecting requests
@@ -46,11 +53,11 @@ pub struct BatchEngine;
 impl BatchEngine {
     /// Start the batch engine on a dedicated thread.
     /// Returns a sender for submitting requests.
-    pub fn start(config: BatchEngineConfig) -> mpsc::Sender<BatchRequest> {
+    pub fn start(model: Arc<Qwen3TTS>, config: BatchEngineConfig) -> mpsc::Sender<BatchRequest> {
         let (tx, rx) = mpsc::channel::<BatchRequest>(config.max_batch_size * 4);
 
         std::thread::spawn(move || {
-            if let Err(e) = Self::run_loop(rx, config) {
+            if let Err(e) = Self::run_loop(rx, config, &model) {
                 tracing::error!("Batch engine crashed: {e:#}");
             }
         });
@@ -61,11 +68,8 @@ impl BatchEngine {
     fn run_loop(
         mut rx: mpsc::Receiver<BatchRequest>,
         config: BatchEngineConfig,
+        model: &Qwen3TTS,
     ) -> Result<()> {
-        let device = qwen3_tts::auto_device()?;
-        info!(?device, "Batch engine loading model");
-
-        let model = Qwen3TTS::from_pretrained(&config.model_dir, device.clone())?;
         info!("Batch engine ready, max_batch={}", config.max_batch_size);
 
         loop {
@@ -99,13 +103,53 @@ impl BatchEngine {
             let t0 = Instant::now();
 
             if batch_size > 1 {
-                // Try batched forward pass (all sequences in one GPU pass)
-                let requests: Vec<(String, qwen3_tts::Language, Option<SynthesisOptions>)> = batch
+                // Build per-request voice clone prompts; fail requests where clone was requested but failed
+                let mut failed_indices = Vec::new();
+                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = batch
                     .iter()
-                    .map(|r| (r.text.clone(), r.language, Some(r.options.clone())))
+                    .enumerate()
+                    .map(|(idx, r)| {
+                        r.voice_clone.as_ref().and_then(|vc| {
+                            match qwen3_tts::AudioBuffer::load(&vc.ref_audio_path) {
+                                Ok(ref_buf) => match model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()) {
+                                    Ok(prompt) => Some(prompt),
+                                    Err(e) => { warn!("Voice clone prompt failed: {e:#}"); failed_indices.push(idx); None }
+                                },
+                                Err(e) => { warn!("Voice clone ref_audio load failed: {e:#}"); failed_indices.push(idx); None }
+                            }
+                        })
+                    })
                     .collect();
 
-                match model.synthesize_batch(&requests) {
+                // Send errors for failed voice clone requests before batching
+                for &idx in failed_indices.iter().rev() {
+                    let req = batch.remove(idx);
+                    let _ = req.reply.send(Err(anyhow::anyhow!("Voice clone failed")));
+                }
+                if batch.is_empty() { continue; }
+
+                // Rebuild requests/prompts without failed entries
+                let requests: Vec<(String, qwen3_tts::Language, Option<SynthesisOptions>)> = batch
+                    .iter()
+                    .map(|r| {
+                        let word_count = r.text.split_whitespace().count();
+                        let adaptive_max = ((word_count * 6) + 50).min(512).max(100);
+                        let mut opts = r.options.clone();
+                        opts.max_length = adaptive_max;
+                        (r.text.clone(), r.language, Some(opts))
+                    })
+                    .collect();
+                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = {
+                    let mut kept = Vec::new();
+                    for (idx, p) in prompts.into_iter().enumerate() {
+                        if !failed_indices.contains(&idx) { kept.push(p); }
+                    }
+                    kept
+                };
+                let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
+                    prompts.iter().map(|p| p.as_ref()).collect();
+
+                match model.synthesize_batch_with_voices(&requests, &prompt_refs) {
                     Ok(audios) => {
                         let gen_time = t0.elapsed().as_secs_f32();
                         let per_req = gen_time / audios.len() as f32;
@@ -121,6 +165,39 @@ impl BatchEngine {
                         continue;
                     }
                     Err(e) => {
+                        let err_msg = format!("{e:#}");
+                        if err_msg.contains("out of memory") || err_msg.contains("OOM") {
+                            // OOM: split batch in half and retry
+                            let mid = batch.len() / 2;
+                            warn!(batch_size, mid, "OOM in batch, splitting and retrying");
+                            let second_half: Vec<BatchRequest> = batch.drain(mid..).collect();
+                            // Re-queue second half by processing after first half
+                            // Process first half sequentially (safe)
+                            for req in batch {
+                                let t_req = Instant::now();
+                                let result = Self::process_single(&model, &req);
+                                let gen_time = t_req.elapsed().as_secs_f32();
+                                let reply = match result {
+                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
+                                    Err(e) => Err(e),
+                                };
+                                let _ = req.reply.send(reply);
+                            }
+                            // Process second half sequentially
+                            for req in second_half {
+                                let t_req = Instant::now();
+                                let result = Self::process_single(&model, &req);
+                                let gen_time = t_req.elapsed().as_secs_f32();
+                                let reply = match result {
+                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
+                                    Err(e) => Err(e),
+                                };
+                                let _ = req.reply.send(reply);
+                            }
+                            let total = t0.elapsed().as_secs_f32();
+                            info!(total_secs = total, "OOM recovery complete (sequential fallback)");
+                            continue;
+                        }
                         warn!("Batched forward failed: {e:#}, falling back to sequential");
                     }
                 }
@@ -169,23 +246,24 @@ impl BatchEngine {
     }
 }
 
-/// Blocking recv with timeout for std mpsc
+/// Blocking recv with timeout using OS-level sleep instead of busy-wait poll.
 trait BlockingRecvTimeout<T> {
     fn blocking_recv_timeout(&mut self, timeout: std::time::Duration) -> Result<T, ()>;
 }
 
 impl<T> BlockingRecvTimeout<T> for mpsc::Receiver<T> {
     fn blocking_recv_timeout(&mut self, timeout: std::time::Duration) -> Result<T, ()> {
-        // Use tokio's blocking_recv with a manual timeout
-        let start = Instant::now();
+        let deadline = Instant::now() + timeout;
         loop {
             match self.try_recv() {
                 Ok(val) => return Ok(val),
                 Err(mpsc::error::TryRecvError::Empty) => {
-                    if start.elapsed() >= timeout {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         return Err(());
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // Sleep with OS scheduler (no busy-wait), check every 10ms
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => return Err(()),
             }

@@ -61,13 +61,15 @@ Build: flash-attn enabled, `CUDA_COMPUTE_CAP=89`, compiled on H100.
 
 | Batch | Audio total | Wall time | Throughput (RTx) | Latency/req |
 |-------|------------|-----------|------------------|-------------|
-| 1 | 5.0s | 2.6s | 1.91x | 2.6s |
-| 2 | 9.8s | 2.6s | 3.69x | 1.3s |
-| 4 | 19.2s | 3.0s | 6.40x | 0.7s |
-| 8 | 40.6s | 4.1s | 9.98x | 0.5s |
-| 16 | OOM | — | — | — |
+| 1 | 5.0s | 2.6s | 1.94x | 2.6s |
+| 2 | 9.8s | 2.9s | 3.42x | 1.4s |
+| 4 | 19.2s | 3.2s | 5.99x | 0.8s |
+| 8 | 40.6s | 4.2s | 9.70x | 0.5s |
+| 16 | 81.4s | 6.1s | 13.43x | 0.4s |
 
-Streaming TTFA (Time To First Audio): ~490ms (single sequence).
+Streaming TTFA (Time To First Audio): ~482ms (single sequence).
+
+Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces KV cache pre-allocation by ~75%.
 
 ### Upstream `qwen3-tts-rs` baseline (same L4)
 
@@ -89,8 +91,8 @@ Streaming TTFA (Time To First Audio): ~490ms (single sequence).
 
 | Metric | vLLM-Omni | qwen3-tts-server |
 |--------|-----------|------------------|
-| Single RTx (denise voice) | 1.9x | 1.91x |
-| Batch throughput | ~5.5x at 8 CCU (estimated) | 9.98x at batch=8 |
+| Single RTx (denise voice) | 1.9x | 1.94x |
+| Batch throughput | ~5.5x at 8 CCU (estimated) | 13.43x at batch=16 |
 | VRAM idle | ~8GB+ | 2.7GB |
 | Voice cloning | Yes (via API) | Yes (ref_audio base64, batched) |
 | Streaming | WebSocket | HTTP chunked transfer |
@@ -110,6 +112,7 @@ Streaming TTFA (Time To First Audio): ~490ms (single sequence).
 | `18ce1e9` | Voice cloning in batch mode + busy-wait fix (10ms) | Batch=8: 9.56x → 9.98x RT, voice clone no longer falls back to sequential |
 | `31acfab` | Batched streaming worker (up to 8 concurrent streams) | Streaming uses `synthesize_batch_streaming`, decodes every 10 frames |
 | `1c3fc94` | Batched code predictor in streaming path | TTFA 761ms → 490ms, streaming now uses `generate_acoustic_codes_batched()` |
+| `059ac10` | Adaptive max_length + OOM batch splitting | Batch=16 on L4: 13.43x RT (0.4s/req), KV cache 2048→122 for call center text |
 
 ### Failed experiments
 
@@ -176,10 +179,7 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
 2. ~~**Voice cloning in batch mode**~~ ✅ `18ce1e9` — `synthesize_batch_with_voices()` accepts per-request `VoiceClonePrompt`. Mixed batches (some clone, some Serena) supported. `BatchEngine` creates prompts from ref_audio and passes to batch API.
 
-3. **Batch=16 OOM on L4** — KV cache grows linearly with batch size. Options:
-   - Quantized KV cache (INT8/FP8)
-   - Dynamic batch sizing based on available VRAM
-   - Sequence-length-aware batching (short texts grouped together)
+3. ~~**Batch=16 OOM on L4**~~ ✅ `059ac10` — Adaptive `max_length` (~6 frames/word, cap 512) reduces KV cache from 2048→~122 for call center text. OOM recovery splits batch and falls back to sequential. Batch=16: 13.43x RT, 0.4s/req.
 
 ### P1 — Important
 

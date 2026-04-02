@@ -15,9 +15,29 @@ use batch::{BatchEngine, BatchEngineConfig, BatchRequest, VoiceCloneData};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qwen3_tts::{Language, SynthesisOptions};
 use serde::{Deserialize, Serialize};
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::info;
+
+struct Metrics {
+    requests_total: AtomicU64,
+    requests_streaming: AtomicU64,
+    errors_total: AtomicU64,
+    audio_seconds_total: AtomicU64, // stored as milliseconds
+    gen_seconds_total: AtomicU64,   // stored as milliseconds
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            requests_total: AtomicU64::new(0),
+            requests_streaming: AtomicU64::new(0),
+            errors_total: AtomicU64::new(0),
+            audio_seconds_total: AtomicU64::new(0),
+            gen_seconds_total: AtomicU64::new(0),
+        }
+    }
+}
 
 struct AppState {
     tx: mpsc::Sender<BatchRequest>,
@@ -25,6 +45,7 @@ struct AppState {
     semaphore: Arc<Semaphore>,
     max_batch: usize,
     model_dir: String,
+    metrics: Arc<Metrics>,
 }
 
 #[derive(Deserialize)]
@@ -100,8 +121,31 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok", queue_depth: queue, max_batch: state.max_batch })
 }
 
+async fn metrics(State(state): State<Arc<AppState>>) -> String {
+    let m = &state.metrics;
+    let audio_s = m.audio_seconds_total.load(Ordering::Relaxed) as f64 / 1000.0;
+    let gen_s = m.gen_seconds_total.load(Ordering::Relaxed) as f64 / 1000.0;
+    let avg_rtf = if gen_s > 0.0 { audio_s / gen_s } else { 0.0 };
+    format!(
+        "# HELP tts_requests_total Total synthesis requests\ntts_requests_total {}\n\
+         # HELP tts_requests_streaming Total streaming requests\ntts_requests_streaming {}\n\
+         # HELP tts_errors_total Total errors\ntts_errors_total {}\n\
+         # HELP tts_audio_seconds_total Total audio generated (seconds)\ntts_audio_seconds_total {:.1}\n\
+         # HELP tts_gen_seconds_total Total generation time (seconds)\ntts_gen_seconds_total {:.1}\n\
+         # HELP tts_avg_rtf Average real-time factor\ntts_avg_rtf {:.2}\n\
+         # HELP tts_queue_depth Current queue depth\ntts_queue_depth {}\n",
+        m.requests_total.load(Ordering::Relaxed),
+        m.requests_streaming.load(Ordering::Relaxed),
+        m.errors_total.load(Ordering::Relaxed),
+        audio_s, gen_s, avg_rtf,
+        state.max_batch - state.semaphore.available_permits(),
+    )
+}
+
 async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRequest>) -> Response {
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     if req.stream.unwrap_or(false) {
+        state.metrics.requests_streaming.fetch_add(1, Ordering::Relaxed);
         return synthesize_streaming(state, req).await;
     }
 
@@ -129,14 +173,16 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
             drop(permit);
             let duration = result.audio.samples.len() as f32 / result.audio.sample_rate as f32;
             let rtf = duration / result.gen_time_secs;
+            state.metrics.audio_seconds_total.fetch_add((duration * 1000.0) as u64, Ordering::Relaxed);
+            state.metrics.gen_seconds_total.fetch_add((result.gen_time_secs * 1000.0) as u64, Ordering::Relaxed);
             info!(duration, gen_time = result.gen_time_secs, rtf, "Done");
             match audio_to_wav_bytes(&result.audio.samples, result.audio.sample_rate) {
                 Ok(wav) => (StatusCode::OK, [("content-type", "audio/wav"), ("x-rtf", &format!("{rtf:.2}"))], wav).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e:#}") })).into_response(),
             }
         }
-        Ok(Err(e)) => { drop(permit); (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e:#}") })).into_response() }
-        Err(_) => { drop(permit); (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Dropped".into() })).into_response() }
+        Ok(Err(e)) => { drop(permit); state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e:#}") })).into_response() }
+        Err(_) => { drop(permit); state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Dropped".into() })).into_response() }
     }
 }
 
@@ -160,6 +206,7 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
         .status(StatusCode::OK)
         .header("content-type", "audio/wav")
         .header("transfer-encoding", "chunked")
+        .header("x-audio-format", "pcm-s16le-24000-mono")
         .body(body)
         .unwrap()
 }
@@ -281,10 +328,12 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         tx, stream_tx, semaphore: Arc::new(Semaphore::new(max_inflight)), max_batch, model_dir,
+        metrics: Arc::new(Metrics::new()),
     });
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/audio/speech", post(synthesize))
         .with_state(state);
 

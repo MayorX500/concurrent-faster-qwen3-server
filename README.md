@@ -209,6 +209,47 @@ modal run modal_flash_batch.py      # benchmark on L4
 modal run modal_test.py             # run unit tests
 ```
 
+## Benchmarking
+
+All benchmarks run on Modal with real GPU instances:
+
+```bash
+# Batch throughput benchmark (1/2/4/8/16 concurrent requests)
+modal run modal_flash_batch.py
+
+# Detailed profiling (per-phase timing: prefill, generation, decode)
+modal run modal_profile.py
+
+# Run unit tests
+modal run modal_test.py
+```
+
+Local benchmark with `curl` (server must be running):
+
+```bash
+# Single request latency
+time curl -s -X POST http://localhost:8090/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Buenos días, le habla el asistente virtual del centro de atención.", "language": "spanish"}' \
+  --output /dev/null -w "HTTP %{http_code}, %{time_total}s\n"
+
+# Concurrent requests (requires GNU parallel)
+seq 8 | parallel -j8 'curl -s -X POST http://localhost:8090/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d "{\"text\": \"Asistente número {}. ¿En qué puedo ayudarle?\", \"language\": \"spanish\"}" \
+  --output /tmp/out_{}.wav -w "req {}: %{time_total}s\n"'
+
+# Voice cloning latency
+REF_B64=$(base64 -w0 reference.wav)
+time curl -s -X POST http://localhost:8090/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d "{\"text\": \"Prueba de clonación\", \"language\": \"spanish\", \"ref_audio\": \"$REF_B64\", \"ref_text\": \"Transcripción del audio de referencia.\"}" \
+  --output clone_test.wav
+
+# Check metrics after load test
+curl -s http://localhost:8090/metrics
+```
+
 ## Architecture
 
 - Axum HTTP server with dedicated batch engine thread

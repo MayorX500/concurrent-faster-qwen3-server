@@ -1045,7 +1045,33 @@ impl Qwen3TTS {
                 let mut audio = self.decode_codes(&combined)?;
                 let cut = ref_len * audio.len() / total_len.max(1);
                 audio.samples = audio.samples[cut..].to_vec();
-                audio
+
+                // ICL generates ~1.7x more frames than needed. Drop excess codec
+                // frames uniformly BEFORE vocoder decode to get correct duration
+                // without pitch distortion.
+                let expected_frames = (input_ids.len() * 2).max(8);
+                let gen_frames = &all_codes;
+                if gen_frames.len() > expected_frames * 13 / 10 {
+                    // Re-decode with subsampled frames
+                    let step = gen_frames.len() as f64 / expected_frames as f64;
+                    let mut selected: Vec<Vec<u32>> = Vec::with_capacity(expected_frames);
+                    for i in 0..expected_frames {
+                        let idx = (i as f64 * step) as usize;
+                        if idx < gen_frames.len() {
+                            selected.push(gen_frames[idx].clone());
+                        }
+                    }
+                    // Prepend ref for vocoder context, decode, cut
+                    let mut combined2 = ref_frames.clone();
+                    combined2.extend(selected);
+                    let total2 = combined2.len();
+                    let mut audio2 = self.decode_codes(&combined2)?;
+                    let cut2 = ref_len * audio2.len() / total2.max(1);
+                    audio2.samples = audio2.samples[cut2..].to_vec();
+                    audio2
+                } else {
+                    audio
+                }
             }
         } else {
             self.decode_codes(&all_codes)?

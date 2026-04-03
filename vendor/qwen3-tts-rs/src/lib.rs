@@ -999,7 +999,9 @@ impl Qwen3TTS {
                 // the ICL context, not the stale prefill hidden state.
                 last_hidden = last_icl_hidden;
 
-                (icl_trailing, new_logits)
+                // Use target text only for generation (ICL prefill already consumed ref_text)
+                let trailing = self.build_default_trailing_text(&input_ids)?;
+                (trailing, new_logits)
             } else {
                 let trailing = self.build_default_trailing_text(&input_ids)?;
                 (trailing, logits)
@@ -1031,20 +1033,13 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _decode_span = tracing::info_span!("decode").entered();
 
-        let audio = if let Some(ref_codes) = &prompt.ref_codes {
-            // ICL: prepend ref_codes, decode together, proportional cut (Python reference)
-            let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
-            let ref_len = ref_frames.len();
+        let audio = if prompt.ref_codes.is_some() {
+            // ICL: generation loop only produced target text frames
+            // (ref_text was consumed by ICL prefill). Decode directly.
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
             } else {
-                let mut combined = ref_frames;
-                combined.extend(all_codes.iter().cloned());
-                let total_len = combined.len();
-                let mut audio = self.decode_codes(&combined)?;
-                let cut = ref_len * audio.len() / total_len.max(1);
-                audio.samples = audio.samples[cut..].to_vec();
-                audio
+                self.decode_codes(&all_codes)?
             }
         } else {
             self.decode_codes(&all_codes)?

@@ -1032,14 +1032,27 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _decode_span = tracing::info_span!("decode").entered();
 
-        let audio = if let Some(ref_codes) = &prompt.ref_codes {
+        let audio = if let (Some(ref_codes), Some(ref_text_ids)) = (&prompt.ref_codes, &prompt.ref_text_ids) {
             let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
             let ref_len = ref_frames.len();
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
             } else {
+                // Model generates frames for ref_text + target_text.
+                // Skip warm-up frames (ref_text portion) from generated codes.
+                let ref_text_len = ref_text_ids.len();
+                let target_text_len = input_ids.len();
+                let total_text = ref_text_len + target_text_len + 1;
+                let warmup_frames = all_codes.len() * ref_text_len / total_text.max(1);
+                let target_codes = if warmup_frames > 0 && warmup_frames < all_codes.len() {
+                    &all_codes[warmup_frames..]
+                } else {
+                    &all_codes[..]
+                };
+
+                // Prepend ref_codes for vocoder context, decode, proportional cut
                 let mut combined = ref_frames;
-                combined.extend(all_codes.iter().cloned());
+                combined.extend(target_codes.iter().cloned());
                 let total_len = combined.len();
                 let mut audio = self.decode_codes(&combined)?;
                 let cut = ref_len * audio.len() / total_len.max(1);

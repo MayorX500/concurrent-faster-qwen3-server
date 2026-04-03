@@ -2088,10 +2088,10 @@ pub const CODEC_EOS_TOKEN_ID: u32 = codec_tokens::CODEC_EOS;
 pub const SAMPLES_PER_FRAME: usize = 1920;
 
 /// ICL mode: minimum frames to generate regardless of text length (matching mlx-audio)
-const ICL_MIN_FRAMES: usize = 30;
+const ICL_MIN_FRAMES: usize = 75;
 
 /// ICL mode: estimated frames per input text token for max-length cap (matching mlx-audio)
-const ICL_FRAMES_PER_TOKEN: usize = 3;
+const ICL_FRAMES_PER_TOKEN: usize = 6;
 
 /// ICL mode: minimum repetition penalty to prevent degenerate loops (matching mlx-audio)
 const ICL_MIN_REPETITION_PENALTY: f64 = 1.5;

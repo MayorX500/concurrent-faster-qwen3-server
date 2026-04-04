@@ -217,6 +217,11 @@ struct StreamingRequest {
 }
 
 fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<StreamingRequest> {
+    let stream_max_batch: usize = std::env::var("STREAM_MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let stream_wait_ms: u64 = std::env::var("STREAM_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+    let stream_poll_ms: u64 = std::env::var("STREAM_POLL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let stream_chunk_frames: usize = std::env::var("STREAM_CHUNK_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+
     let (tx, rx) = mpsc::channel::<StreamingRequest>(16);
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
 
@@ -233,18 +238,18 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
                 }
             };
 
-            // Collect more requests within 50ms for batching
+            // Collect more requests within window for batching
             let mut batch = vec![first];
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(stream_wait_ms);
             loop {
-                if batch.len() >= 8 { break; }
+                if batch.len() >= stream_max_batch { break; }
                 let mut guard = rx.lock().unwrap_or_else(|e| { tracing::error!("streaming mutex poisoned, recovering"); e.into_inner() });
                 match guard.try_recv() {
                     Ok(r) => { batch.push(r); }
                     Err(_) => {
                         drop(guard);
                         if std::time::Instant::now() >= deadline { break; }
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::sleep(std::time::Duration::from_millis(stream_poll_ms));
                     }
                 }
             }
@@ -277,7 +282,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
                 }).collect();
 
             // Run batched streaming (decodes + sends every 10 frames ~800ms)
-            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, 10) {
+            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, stream_chunk_frames) {
                 for req in &batch {
                     let _ = req.tx.blocking_send(Err(format!("{e}")));
                 }

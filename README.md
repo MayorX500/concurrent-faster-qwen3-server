@@ -21,7 +21,7 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 | 8 | 11.49x RT | 0.4s | 11 | ~4GB |
 | 16 | 16.59x RT | 0.3s | 16 | ~5GB |
 
-Streaming TTFA: 450ms. In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
+Streaming TTFA: 700ms (with voice cloning, cached). In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
 
 ### vs other TTS models (L4)
 
@@ -47,9 +47,9 @@ Full comparison with 29+ models: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALU
 ### 1. Download the binary
 
 ```bash
-curl --header "PRIVATE-TOKEN: <your-token>" \
-  -o qwen3-tts-server \
-  "https://scovil.labtau.com/api/v4/projects/622/packages/generic/qwen3-tts-server/0.4.7/qwen3-tts-server-v0.4.7-linux-x86_64"
+# From GitLab package registry
+curl -o qwen3-tts-server \
+  "https://scovil.labtau.com/api/v4/projects/622/packages/generic/qwen3-tts-server/v0.5.2/qwen3-tts-server-v0.5.2-linux-x86_64"
 chmod +x qwen3-tts-server
 ```
 
@@ -108,22 +108,24 @@ Synthesize speech from text. Supports standard synthesis, voice cloning, and str
 
 - Content-Type: `audio/wav`
 - Sample rate: 24000 Hz, 16-bit PCM, mono
-- Headers: `x-rtf` (real-time factor)
+- Headers: `x-rtf` (real-time factor), `x-ttfa-ms` (time to first audio in milliseconds)
 
 #### Streaming response
 
 When `stream: true`:
 - Content-Type: `audio/wav`
 - Transfer-Encoding: `chunked`
-- Header: `x-audio-format: pcm-s16le-24000-mono`
+- Headers: `x-audio-format: pcm-s16le-24000-mono`, `x-ttfa-ms` (time to first audio)
 - First chunk: 44-byte WAV header, then PCM data chunks (~800ms each)
 
 #### Error responses
 
 | Status | Body | Cause |
 |--------|------|-------|
-| 503 | `{"error": "Queue full"}` | All batch slots occupied |
-| 500 | `{"error": "<message>"}` | Synthesis failed (model error, voice clone failure, etc.) |
+| 400 | `{"error": "<message>"}` | Invalid input: empty text, bad language, invalid ref_audio WAV |
+| 413 | `{"error": "ref_audio exceeds ... limit"}` | ref_audio too large |
+| 503 | `{"error": "Queue full"}` / `{"error": "Stream queue full"}` | All batch/stream slots occupied |
+| 500 | `{"error": "<message>"}` | Synthesis failed (model error, voice clone failure) |
 
 #### Examples
 
@@ -194,6 +196,36 @@ tts_queue_depth 3
 | `MAX_WAIT_MS` | `200` | Max wait to fill batch before processing (ms) |
 | `PORT` | `8090` | HTTP listen port |
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `STREAM_MAX_BATCH` | `8` | Max concurrent streaming requests per batch |
+| `STREAM_WAIT_MS` | `50` | Wait window to collect streaming batch (ms) |
+| `STREAM_CHUNK_FRAMES` | `10` | Frames per streaming chunk (~800ms audio) |
+| `MAX_REF_AUDIO_BYTES` | `10485760` | Max ref_audio size (10MB) |
+
+## Voice Cloning
+
+Two modes available:
+
+- **x_vector** (no `ref_text`): Uses speaker embedding only. Captures timbre, fast inference.
+- **ICL** (with `ref_text`): Uses speaker embedding + reference audio codes. Better prosody matching.
+
+### Best practices
+
+- **Reference audio**: 6-15 seconds of clean speech, 24kHz mono WAV
+- **Transcript**: Use Whisper to generate accurate `ref_text` — improves similarity from ~0.75 to ~0.89
+- **Language matching**: Clone in Spanish → synthesize in Spanish
+- **Temperature**: 0.8 recommended for voice cloning
+- **Speaker cache**: Same `ref_audio` bytes are cached automatically — second request is instant
+
+### TTFA (Time To First Audio)
+
+| Scenario | TTFA |
+|----------|------|
+| Streaming, no voice cloning | ~700ms |
+| Streaming + voice cloning (first call, cold) | ~785ms |
+| Streaming + voice cloning (same voice, cached) | ~700ms |
+| Non-streaming + voice cloning (cached) | ~2800ms |
+
+The server warms up CUDA kernels at startup (speaker encoder + transformer + vocoder). First real request has no compilation penalty.
 
 ## Deployment
 

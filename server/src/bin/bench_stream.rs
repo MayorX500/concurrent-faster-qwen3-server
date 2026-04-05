@@ -47,7 +47,7 @@ fn main() {
 
         // Run batched streaming
         let chunk_frames = 5; // ~400ms audio per chunk
-        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames) {
+        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames, &vec![None; requests.len()]) {
             println!("Batch stream {n}: FAILED: {e:#}");
             continue;
         }

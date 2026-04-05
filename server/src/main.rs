@@ -10,13 +10,19 @@ use axum::{
     Json, Router,
 };
 use base64::Engine;
-use batch::{BatchEngine, BatchEngineConfig, BatchRequest, VoiceCloneData};
+use batch::{BatchEngine, BatchEngineConfig, BatchRequest, VoiceCloneData, build_voice_clone_prompts};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qwen3_tts::{Language, SynthesisOptions};
 use serde::{Deserialize, Serialize};
 use std::{io::Cursor, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::info;
+
+fn rand_u64() -> u64 {
+    let mut buf = [0u8; 8];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| { use std::io::Read; f.read_exact(&mut buf) }).unwrap_or_default();
+    u64::from_ne_bytes(buf)
+}
 
 struct Metrics {
     requests_total: AtomicU64,
@@ -172,7 +178,7 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
 
     let voice_clone = match decode_ref_audio(&req) {
         Ok(vc) => vc,
-        Err((status, msg)) => return (status, Json(ErrorResponse { error: msg })).into_response(),
+        Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -210,13 +216,18 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
     let language = parse_language(&req.language).unwrap();
     let text = req.text.clone();
 
+    let voice_clone = match decode_ref_audio(&req) {
+        Ok(vc) => vc,
+        Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
+    };
+
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>(32);
 
-    // Submit to streaming worker
-    let stream_req = StreamingRequest { text, language, temperature: req.temperature.unwrap_or(0.7), tx };
-    if state.stream_tx.send(stream_req).await.is_err() {
+    // Submit to streaming worker — fail fast if queue full (#33)
+    let stream_req = StreamingRequest { text, language, temperature: req.temperature.unwrap_or(0.7), voice_clone, tx };
+    if let Err(_) = state.stream_tx.try_send(stream_req) {
         state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Stream engine down".into() })).into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Stream queue full".into() })).into_response();
     }
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -235,6 +246,7 @@ struct StreamingRequest {
     text: String,
     language: Language,
     temperature: f64,
+    voice_clone: Option<VoiceCloneData>,
     tx: mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
@@ -279,24 +291,76 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
             let n = batch.len();
             info!(batch_size = n, "Streaming batch");
 
+            // Build voice clone prompts — fail requests where clone was requested but failed (#27)
+            let vc_refs: Vec<Option<&VoiceCloneData>> = batch.iter().map(|r| r.voice_clone.as_ref()).collect();
+            let (prompts, failed) = build_voice_clone_prompts(&model, &vc_refs);
+
+            // Send error to failed voice clone requests instead of silent fallback
+            for &idx in failed.iter().rev() {
+                let req = batch.remove(idx);
+                let _ = req.tx.blocking_send(Err("Voice clone failed".into()));
+            }
+            if batch.is_empty() { continue; }
+
+            // Rebuild prompts without failed entries
+            let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = {
+                let mut kept = Vec::new();
+                for (idx, p) in prompts.into_iter().enumerate() {
+                    if !failed.contains(&idx) { kept.push(p); }
+                }
+                kept
+            };
+
+            // Split: ICL requests use non-streaming path for quality, rest use streaming
+            let mut stream_batch: Vec<StreamingRequest> = Vec::new();
+            let mut stream_prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = Vec::new();
+            for (req, prompt) in batch.into_iter().zip(prompts.into_iter()) {
+                let is_icl = req.voice_clone.as_ref().map_or(false, |vc| vc.ref_text.is_some());
+                if is_icl {
+                    // ICL: use non-streaming synthesize_voice_clone for quality parity
+                    let prompt = prompt.unwrap(); // ICL always has prompt
+                    let opts = qwen3_tts::SynthesisOptions { temperature: req.temperature, ..Default::default() };
+                    match model.synthesize_voice_clone(&req.text, &prompt, req.language, Some(opts)) {
+                        Ok(audio) => {
+                            let _ = req.tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF)));
+                            let _ = req.tx.blocking_send(Ok(samples_to_pcm16(&audio.samples)));
+                        }
+                        Err(e) => { let _ = req.tx.blocking_send(Err(format!("{e}"))); }
+                    }
+                } else {
+                    stream_batch.push(req);
+                    stream_prompts.push(prompt);
+                }
+            }
+
+            // Process remaining non-ICL requests via streaming
+            if stream_batch.is_empty() { continue; }
+            let batch = stream_batch;
+            let prompts = stream_prompts;
+            let n = batch.len();
+
             let requests: Vec<(String, qwen3_tts::Language, Option<qwen3_tts::SynthesisOptions>)> = batch.iter()
                 .map(|r| (r.text.clone(), r.language,
                     Some(qwen3_tts::SynthesisOptions { temperature: r.temperature, ..Default::default() })
                 )).collect();
+            let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
+                prompts.iter().map(|p| p.as_ref()).collect();
+
             let (senders, receivers): (Vec<_>, Vec<_>) = (0..n)
                 .map(|_| std::sync::mpsc::channel::<qwen3_tts::AudioBuffer>()).unzip();
 
-            // Send WAV headers
-            for req in &batch {
-                let _ = req.tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF)));
-            }
-
             // Forward decoded audio chunks: std::sync → tokio channels as PCM
+            // WAV header sent with first chunk, not before synthesis (#37)
             let forwards: Vec<std::thread::JoinHandle<()>> = receivers.into_iter()
                 .zip(batch.iter().map(|r| r.tx.clone()))
                 .map(|(rx, tx)| {
                     std::thread::spawn(move || {
+                        let mut header_sent = false;
                         while let Ok(audio) = rx.recv() {
+                            if !header_sent {
+                                if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { break; }
+                                header_sent = true;
+                            }
                             let pcm = samples_to_pcm16(&audio.samples);
                             if tx.blocking_send(Ok(pcm)).is_err() { break; }
                         }
@@ -304,7 +368,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
                 }).collect();
 
             // Run batched streaming (decodes + sends every 10 frames ~800ms)
-            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, stream_chunk_frames) {
+            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, stream_chunk_frames, &prompt_refs) {
                 for req in &batch {
                     let _ = req.tx.blocking_send(Err(format!("{e}")));
                 }
@@ -339,9 +403,14 @@ fn decode_ref_audio(req: &SpeechRequest) -> Result<Option<VoiceCloneData>, (Stat
     if bytes.len() > limit {
         return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("ref_audio exceeds {limit} byte limit")));
     }
-    let tmp = std::env::temp_dir().join(format!("ref_{}.wav",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+    let tmp = std::env::temp_dir().join(format!("ref_{:016x}{:016x}.wav",
+        rand_u64(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64));
     std::fs::write(&tmp, &bytes).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ref_audio: {e}")))?;
+    // Validate WAV is loadable before accepting (#34)
+    if qwen3_tts::AudioBuffer::load(&tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err((StatusCode::BAD_REQUEST, "ref_audio is not a valid WAV file".into()));
+    }
     Ok(Some(VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone() }))
 }
 
@@ -433,9 +502,9 @@ mod tests {
 
     #[test]
     fn test_decode_ref_audio_valid_base64() {
-        // Minimal WAV: just some bytes encoded as base64
-        let bytes = vec![0u8; 44]; // fake WAV header
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        // Generate a real minimal WAV for validation
+        let wav_bytes = audio_to_wav_bytes(&vec![0.0f32; 2400], 24000).unwrap(); // 100ms silence
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&wav_bytes);
         let req = SpeechRequest {
             text: "test".into(),
             language: "spanish".into(),

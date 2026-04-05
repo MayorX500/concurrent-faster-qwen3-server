@@ -924,15 +924,22 @@ impl Qwen3TTS {
             options.repetition_penalty
         };
         let max_new_tokens = if is_icl {
+            // ICL generates frames for ref_text + target_text combined
+            let ref_text_len = prompt.ref_text_ids.as_ref().map(|t| t.len()).unwrap_or(0);
+            let total_tokens = input_ids.len() + ref_text_len;
             options
                 .max_length
-                .min(ICL_MIN_FRAMES.max(input_ids.len() * ICL_FRAMES_PER_TOKEN))
+                .min(ICL_MIN_FRAMES.max(total_tokens * ICL_FRAMES_PER_TOKEN))
         } else {
             options.max_length
         };
         let mut gen_config = options.to_gen_config();
         gen_config.max_new_tokens = max_new_tokens;
         gen_config.repetition_penalty = repetition_penalty;
+        // Prevent premature EOS in voice cloning — but don't force past natural stop
+        if is_icl {
+            gen_config.min_new_tokens = gen_config.min_new_tokens.max(input_ids.len().max(20));
+        }
 
         // Cast speaker embedding to compute dtype (speaker encoder produces F32)
         let speaker_embed = prompt.speaker_embedding.to_dtype(self.compute_dtype)?;
@@ -1034,28 +1041,19 @@ impl Qwen3TTS {
 
         let audio = if let (Some(ref_codes), Some(ref_text_ids)) = (&prompt.ref_codes, &prompt.ref_text_ids) {
             let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
-            let ref_len = ref_frames.len();
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
             } else {
-                // Model generates frames for ref_text + target_text.
-                // Skip warm-up frames (ref_text portion) from generated codes.
-                // Warm-up frames = fixed count based on ref_text length (not proportional to output)
-                // ~0.5 frames per ref_text token, minus 1 frame margin for onset preservation
-                let ref_text_len = ref_text_ids.len();
-                let warmup_frames = ref_text_len.saturating_sub(3);
-                let target_codes = if warmup_frames > 0 && warmup_frames < all_codes.len() {
-                    &all_codes[warmup_frames..]
-                } else {
-                    &all_codes[..]
-                };
+                // ICL decode: prepend ref_codes for vocoder continuity, then trim
+                // the ref_audio portion using its known duration.
+                let ref_audio_samples = ref_codes.dim(0)? * (24000 / 12); // 2000 samples per frame at 24kHz/12Hz
 
-                // Prepend ref_codes for vocoder context, decode, proportional cut
                 let mut combined = ref_frames;
-                combined.extend(target_codes.iter().cloned());
-                let total_len = combined.len();
+                combined.extend(all_codes.iter().cloned());
                 let mut audio = self.decode_codes(&combined)?;
-                let cut = ref_len * audio.len() / total_len.max(1);
+
+                // Trim exactly the ref_audio duration from the start
+                let cut = ref_audio_samples.min(audio.samples.len());
                 audio.samples = audio.samples[cut..].to_vec();
                 audio
             }
@@ -1463,33 +1461,61 @@ impl Qwen3TTS {
         requests: &[(String, Language, Option<SynthesisOptions>)],
         senders: &[std::sync::mpsc::Sender<AudioBuffer>],
         chunk_frames: usize,
+        voice_prompts: &[Option<&VoiceClonePrompt>],
     ) -> Result<()> {
         let n = requests.len();
         let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests.to_vec();
 
-        // Reuse the batch setup from synthesize_batch
-        let opts0 = SynthesisOptions::default();
-        let gen_config = opts0.to_gen_config();
+        // Use per-request options or defaults; cap max_new_tokens for safety
+        let opts0 = reqs[0].2.clone().unwrap_or_default();
+        let mut gen_config = opts0.to_gen_config();
+        // Cap streaming generation — 150 frames ≈ 12s max audio per request
+        gen_config.max_new_tokens = gen_config.max_new_tokens.min(150);
 
-        // Phase 1: Build prefill embeddings
+        // Phase 1: Build prefill embeddings (with voice clone support)
+        let role_prefix = self.talker.build_role_prefix_pub()?;
+        let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
+        let vc_prefix_ids = Tensor::new(
+            &[codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS, 0u32, codec_tokens::CODEC_THINK_EOS],
+            &self.device,
+        )?;
+        let vc_suffix_ids = Tensor::new(
+            &[codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
+            &self.device,
+        )?;
+        let vc_suffix_embed = self.talker.codec_embedding_forward(&vc_suffix_ids)?.unsqueeze(0)?;
+
         let mut prefill_embeds: Vec<Tensor> = Vec::with_capacity(n);
         let mut all_input_ids: Vec<Vec<u32>> = Vec::with_capacity(n);
 
-        for (text, lang, _) in &reqs {
+        for (idx, (text, lang, _)) in reqs.iter().enumerate() {
             let input_ids = self.text_tokenizer.encode(text)?;
-            let role_prefix = self.talker.build_role_prefix_pub()?;
-            let codec_ids = Tensor::new(
-                &[codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS,
-                  lang.token_id(), codec_tokens::CODEC_THINK_EOS,
-                  Speaker::Serena.token_id(), codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
-                &self.device,
-            )?;
-            let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
-            let tts_text_embed = self.talker.build_tts_pad_bos_pub(5)?;
-            let codec_first6 = codec_embed.i((.., ..6, ..))?;
-            let codec_hidden = tts_text_embed.add(&codec_first6)?;
+
+            let (codec_hidden, codec_bos_embed) = if let Some(prompt) = voice_prompts.get(idx).and_then(|p| *p) {
+                // Voice clone path
+                let mut pids: Vec<u32> = vc_prefix_ids.to_vec1()?;
+                pids[2] = lang.token_id();
+                let prefix_ids = Tensor::new(pids.as_slice(), &self.device)?;
+                let prefix_embed = self.talker.codec_embedding_forward(&prefix_ids)?.unsqueeze(0)?;
+                let speaker = prompt.speaker_embedding.to_dtype(self.compute_dtype)?
+                    .reshape((1, 1, self.talker.config().hidden_size))?;
+                let codec_embed = Tensor::cat(&[&prefix_embed, &speaker, &vc_suffix_embed], 1)?;
+                let first6 = codec_embed.i((.., ..6, ..))?;
+                (tts_text_embed.add(&first6)?, codec_embed.i((.., 6..7, ..))?)
+            } else {
+                // Default Serena path
+                let codec_ids = Tensor::new(
+                    &[codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS,
+                      lang.token_id(), codec_tokens::CODEC_THINK_EOS,
+                      Speaker::Serena.token_id(), codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
+                    &self.device,
+                )?;
+                let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
+                let first6 = codec_embed.i((.., ..6, ..))?;
+                (tts_text_embed.add(&first6)?, codec_embed.i((.., 6..7, ..))?)
+            };
+
             let mut hidden = Tensor::cat(&[&role_prefix, &codec_hidden], 1)?;
-            let codec_bos_embed = codec_embed.i((.., 6..7, ..))?;
             if let Some(combined) = self.talker.build_first_text_combined_pub(&input_ids, &codec_bos_embed)? {
                 hidden = Tensor::cat(&[&hidden, &combined], 1)?;
             }
@@ -2106,7 +2132,7 @@ const ICL_MIN_FRAMES: usize = 75;
 const ICL_FRAMES_PER_TOKEN: usize = 6;
 
 /// ICL mode: minimum repetition penalty to prevent degenerate loops (matching mlx-audio)
-const ICL_MIN_REPETITION_PENALTY: f64 = 1.5;
+const ICL_MIN_REPETITION_PENALTY: f64 = 1.3;
 
 /// Streaming synthesis session.
 ///

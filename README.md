@@ -6,8 +6,8 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 
 - Batched inference: up to 16 concurrent requests in a single GPU forward pass
 - Voice cloning: clone any voice from a short reference audio (with or without transcript)
-- Streaming: chunked WAV output with 450ms time-to-first-audio
-- Adaptive batching: automatic max_length tuning for call center text
+- Streaming: chunked WAV output with ~330ms time-to-first-audio, cross-fade boundaries
+- Adaptive batching: automatic max_length tuning based on text length (tighter cap for streaming)
 - OOM recovery: automatic batch splitting on GPU memory exhaustion
 - Prometheus metrics: `/metrics` endpoint for monitoring
 - Low VRAM: 2.7GB idle, ~4GB during inference
@@ -21,7 +21,15 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 | 8 | 11.49x RT | 0.4s | 11 | ~4GB |
 | 16 | 16.59x RT | 0.3s | 16 | ~5GB |
 
-Streaming TTFA: 700ms (with voice cloning, cached). In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
+Streaming TTFA: ~330ms (with voice cloning, cached). In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
+
+### Streaming with Voice Clone (L4, 0.6B)
+
+| Phrase | Words | TTFA | Total | Audio | RTF |
+|--------|-------|------|-------|-------|-----|
+| Short | 6 | 323ms | 4.56s | 3.56s | 1.28x |
+| Medium | 17 | 322ms | 8.92s | 4.70s | 1.90x |
+| Long | 27 | 322ms | 11.01s | 5.33s | 2.06x |
 
 ### vs other TTS models (L4)
 
@@ -47,9 +55,9 @@ Full comparison with 29+ models: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALU
 ### 1. Download the binary
 
 ```bash
-# From GitLab package registry
-curl -o qwen3-tts-server \
-  "https://scovil.labtau.com/api/v4/projects/622/packages/generic/qwen3-tts-server/v0.5.2/qwen3-tts-server-v0.5.2-linux-x86_64"
+# From GitHub releases
+curl -L -o qwen3-tts-server \
+  "https://github.com/alfonsodg/concurrent-faster-qwen3-server/releases/download/v0.7.1/qwen3-tts-server-v0.7.1-linux-x86_64"
 chmod +x qwen3-tts-server
 ```
 
@@ -198,7 +206,7 @@ tts_queue_depth 3
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `STREAM_MAX_BATCH` | `8` | Max concurrent streaming requests per batch |
 | `STREAM_WAIT_MS` | `50` | Wait window to collect streaming batch (ms) |
-| `STREAM_CHUNK_FRAMES` | `10` | Frames per streaming chunk (~800ms audio) |
+| `STREAM_CHUNK_FRAMES` | `3` | Frames per streaming chunk (~250ms audio) |
 | `MAX_REF_AUDIO_BYTES` | `10485760` | Max ref_audio size (10MB) |
 
 ## Voice Cloning
@@ -220,9 +228,9 @@ Two modes available:
 
 | Scenario | TTFA |
 |----------|------|
-| Streaming, no voice cloning | ~700ms |
-| Streaming + voice cloning (first call, cold) | ~785ms |
-| Streaming + voice cloning (same voice, cached) | ~700ms |
+| Streaming, no voice cloning | ~322ms |
+| Streaming + voice cloning (preloaded voice_id) | ~330ms |
+| Streaming + voice cloning (first call, cold) | ~350ms |
 | Non-streaming + voice cloning (cached) | ~2800ms |
 
 The server warms up CUDA kernels at startup (speaker encoder + transformer + vocoder). First real request has no compilation penalty.
@@ -257,8 +265,8 @@ sudo apt install cmake pkg-config libssl-dev libasound2-dev libclang-dev clang
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone git@scovil.labtau.com:ccvass/ai-audio/qwen3-tts-server.git
-cd qwen3-tts-server
+git clone https://github.com/alfonsodg/concurrent-faster-qwen3-server.git
+cd concurrent-faster-qwen3-server
 cargo build --release --features cuda,flash-attn
 
 # Binary at target/release/qwen3-tts-server

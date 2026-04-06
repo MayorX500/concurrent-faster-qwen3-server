@@ -1466,11 +1466,12 @@ impl Qwen3TTS {
         let n = requests.len();
         let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests.to_vec();
 
-        // Use per-request options or defaults; cap max_new_tokens for safety
+        // Use per-request options or defaults
         let opts0 = reqs[0].2.clone().unwrap_or_default();
         let mut gen_config = opts0.to_gen_config();
-        // Cap streaming generation — 150 frames ≈ 12s max audio per request
-        gen_config.max_new_tokens = gen_config.max_new_tokens.min(150);
+        // Use max_length from options (set by caller via adaptive_max_length)
+        // Safety cap: 120 frames ≈ 10s max audio — prevents runaway generation
+        gen_config.max_new_tokens = gen_config.max_new_tokens.min(120);
 
         // Phase 1: Build prefill embeddings (with voice clone support)
         let role_prefix = self.talker.build_role_prefix_pub()?;

@@ -446,7 +446,11 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
             let n = batch.len();
             let requests: Vec<(String, qwen3_tts::Language, Option<qwen3_tts::SynthesisOptions>)> = batch.iter()
                 .map(|r| (r.text.clone(), r.language,
-                    Some(qwen3_tts::SynthesisOptions { temperature: r.temperature, ..Default::default() })
+                    Some(qwen3_tts::SynthesisOptions {
+                        temperature: r.temperature,
+                        max_length: batch::adaptive_max_length_streaming(&r.text),
+                        ..Default::default()
+                    })
                 )).collect();
             let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
                 prompts.iter().map(|p| p.as_deref()).collect();

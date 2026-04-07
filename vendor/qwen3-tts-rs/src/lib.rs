@@ -1753,7 +1753,9 @@ impl Qwen3TTS {
                                 chunk.truncate(chunk.len() - crossfade_len);
                             }
                             if !chunk.is_empty() {
-                                let _ = senders[i].send(AudioBuffer::new(chunk, audio.sample_rate));
+                                if senders[i].send(AudioBuffer::new(chunk, audio.sample_rate)).is_err() {
+                                    done[i] = true; // forward thread closed — stop generating
+                                }
                             }
                         }
                     }

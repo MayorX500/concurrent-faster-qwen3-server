@@ -31,15 +31,18 @@ Streaming TTFA: ~325ms (with voice cloning, preloaded). In a real call center sc
 | Medium | 17 | 326ms | 6.25s | 4.96s | 1.26x |
 | Long | 27 | 321ms | 7.03s | 5.63s | 1.25x |
 
-### vs other TTS models (L4)
+### vs other TTS models (L4 24GB)
 
-| Model | Batching | Best Throughput | Voice Clone | VRAM |
-|-------|----------|----------------|-------------|------|
-| **qwen3-tts-server** (ours) | ✅ Batch=16 | **16.59x RT** | ✅ ICL + x_vector | 2.7GB idle |
-| OmniVoice 0.6B | ❌ Sequential | 6.8x RT | ✅ (slow: 0.25x RT) | 1.9GB |
-| Kokoro 82M | ❌ Single | 15x RT | ✅ (via RVC) | 0.3GB |
-| Supertonic 2 66M | ONNX threads | 68x RT | ❌ (10 fixed) | 0 (CPU) |
-| Higgs Audio V2 3B | ✅ vLLM | 8.0x RT @8 CCU | ✅ | 38GB (L40S only) |
+| Model | Params | Batching | Best Throughput | Voice Clone | Streaming | VRAM | License |
+|-------|--------|----------|----------------|-------------|-----------|------|---------|
+| **qwen3-tts-server** (ours) | 0.6B | ✅ Batch=16 | **16.59x RT** | ✅ ICL + x_vector | ✅ 325ms TTFA | 2.7GB | MIT |
+| OmniVoice 0.6B (k2-fsa) | 0.6B | ❌ Sequential | 6.8x RT | ✅ Zero-shot | ❌ | 2.1GB | Apache 2.0 |
+| VoxCPM2 2B (OpenBMB) | 2B | ✅ Nano-vLLM | 1.0x RT (L4) | ✅ Controllable | ✅ | ~8GB | Apache 2.0 |
+| Multilingual-Exp 0.6B | 0.6B | ✅ vLLM | 14.1x RT @8 CCU | ✅ (bad accent) | ❌ | 12.2GB | Open |
+| Kokoro 82M | 82M | ❌ Single | 15x RT | ✅ (via RVC) | ❌ | 0.3GB | Apache 2.0 |
+| Supertonic 2 66M | 66M | ONNX threads | 68x RT | ❌ (10 fixed) | ❌ | 0 (CPU) | OpenRAIL |
+| Higgs Audio V2 3B | 3B | ✅ vLLM | 8.0x RT @8 CCU | ✅ Good | ❌ | 38GB (L40S) | Apache 2.0 |
+| Voxtral 4B | 4B | ✅ vLLM | 13.5x RT @8 CCU | ❌ | ❌ | 37GB (L40S) | CC-BY-NC |
 
 Full comparison with 29+ models: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALUATION.md)
 

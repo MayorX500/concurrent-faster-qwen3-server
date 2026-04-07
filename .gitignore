@@ -41,3 +41,4 @@ qwen3-tts-server-v*
 
 # Environment
 .env
+qwen3-tts-server-test

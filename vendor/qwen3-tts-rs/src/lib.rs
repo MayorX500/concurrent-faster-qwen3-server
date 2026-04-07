@@ -1462,6 +1462,7 @@ impl Qwen3TTS {
         senders: &[std::sync::mpsc::Sender<AudioBuffer>],
         chunk_frames: usize,
         voice_prompts: &[Option<&VoiceClonePrompt>],
+        stop_flags: &[&std::sync::atomic::AtomicBool],
     ) -> Result<()> {
         let n = requests.len();
         let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests.to_vec();
@@ -1612,14 +1613,14 @@ impl Qwen3TTS {
 
         // Fixed-window vocoder context: decode chunk with last N context frames prepended,
         // trim context audio. O(1) per chunk, seamless boundaries.
-        let vocoder_context_frames: usize = 8;
+        let vocoder_context_frames: usize = 4;
         let samples_per_frame: usize = 24000 / 12; // 2000
         let crossfade_len: usize = 48; // ~2ms at 24kHz — eliminates boundary clicks
         let mut prev_frames: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
         let mut prev_tail: Vec<Vec<f32>> = (0..n).map(|_| Vec::new()).collect();
 
         // Early stopping: detect token repetition (model stuck in loop)
-        let rep_threshold: usize = 5; // stop after 5 consecutive identical tokens
+        let rep_threshold: usize = 3; // stop after 3 consecutive identical tokens
         let mut rep_counts: Vec<usize> = vec![0; n];
         let mut prev_ids: Vec<u32> = vec![u32::MAX; n];
 
@@ -1637,8 +1638,9 @@ impl Qwen3TTS {
                         prev_ids[i] = semantic_ids[i];
                     }
                     let is_stuck = rep_counts[i] >= rep_threshold;
+                    let is_stopped = stop_flags.get(i).map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
 
-                    if is_eos || is_stuck {
+                    if is_eos || is_stuck || is_stopped {
                         done[i] = true;
                         // Flush buffered frames immediately (with context)
                         if !frame_buffers[i].is_empty() {

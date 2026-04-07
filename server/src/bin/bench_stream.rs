@@ -47,7 +47,9 @@ fn main() {
 
         // Run batched streaming
         let chunk_frames = 5; // ~400ms audio per chunk
-        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames, &vec![None; requests.len()]) {
+        let no_stop: Vec<std::sync::atomic::AtomicBool> = (0..requests.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        let stop_refs: Vec<&std::sync::atomic::AtomicBool> = no_stop.iter().collect();
+        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames, &vec![None; requests.len()], &stop_refs) {
             println!("Batch stream {n}: FAILED: {e:#}");
             continue;
         }

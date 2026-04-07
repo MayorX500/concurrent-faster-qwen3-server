@@ -458,13 +458,18 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
             let (senders, receivers): (Vec<_>, Vec<_>) = (0..n)
                 .map(|_| std::sync::mpsc::channel::<qwen3_tts::AudioBuffer>()).unzip();
 
+            // Stop flags: forward threads signal generation loop to stop early
+            let stop_flags: Vec<Arc<std::sync::atomic::AtomicBool>> = (0..n)
+                .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false))).collect();
+
             // Forward decoded audio chunks: std::sync → tokio channels as PCM
             // ICL requests skip ref_audio duration to remove ref_text replay
             // WAV header sent with first real chunk (#37)
             let forwards: Vec<std::thread::JoinHandle<()>> = receivers.into_iter()
                 .zip(batch.iter().map(|r| r.tx.clone()))
                 .zip(skip_samples.iter())
-                .map(|((rx, tx), &skip)| {
+                .zip(stop_flags.iter().cloned())
+                .map(|(((rx, tx), &skip), stop_flag)| {
                     std::thread::spawn(move || {
                         let mut remaining_skip = skip;
                         let mut header_sent = false;
@@ -489,7 +494,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                             // Stop sending on silence (model past EOS)
                             let rms: f32 = (samples.iter().map(|s| s*s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
                             // Stop on silence only after speech has started
-                            if speech_chunks > 2 && rms < 0.003 { break; }
+                            if speech_chunks > 2 && rms < 0.003 { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                             if rms > 0.01 { speech_chunks += 1; }
                             if !header_sent {
                                 if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { break; }
@@ -501,7 +506,8 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                 }).collect();
 
             // Run batched streaming (decodes + sends every 10 frames ~800ms)
-            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, stream_chunk_frames, &prompt_refs) {
+            let stop_refs: Vec<&std::sync::atomic::AtomicBool> = stop_flags.iter().map(|f| f.as_ref()).collect();
+            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, stream_chunk_frames, &prompt_refs, &stop_refs) {
                 for req in &batch {
                     let _ = req.tx.blocking_send(Err(format!("{e}")));
                 }

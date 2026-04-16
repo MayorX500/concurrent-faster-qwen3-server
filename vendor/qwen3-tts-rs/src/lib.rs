@@ -1548,9 +1548,19 @@ impl Qwen3TTS {
         let attn_mask = self.build_batched_causal_mask(&masks, max_prefill_len)?;
 
         // Phase 2: Batched prefill
+        // Use PreAlloc KV caches to avoid CUDA memory fragmentation from Tensor::cat.
+        // Concat caches leak GPU pool memory over many requests with varying lengths.
         let num_layers = self.talker.layers_iter().count();
+        let max_seq = max_prefill_len + gen_config.max_new_tokens + 16;
+        let dtype = self.compute_dtype;
         let mut kv_caches: Vec<models::transformer::AnyKVCache> = (0..num_layers)
-            .map(|_| models::transformer::AnyKVCache::Concat(models::kv_cache::KVCache::new()))
+            .map(|_| {
+                models::kv_cache::PreAllocKVCache::new(
+                    n, self.talker.config().num_key_value_heads, max_seq,
+                    self.talker.config().head_dim, dtype, &self.device,
+                ).map(models::transformer::AnyKVCache::PreAlloc)
+                .unwrap_or_else(|_| models::transformer::AnyKVCache::Concat(models::kv_cache::KVCache::new()))
+            })
             .collect();
 
         let mut hidden = batched_embed;

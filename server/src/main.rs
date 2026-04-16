@@ -488,7 +488,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                                     if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { break; }
                                     header_sent = true;
                                 }
-                                if tx.blocking_send(Ok(samples_to_pcm16(trimmed))).is_err() { break; }
+                                if tx.blocking_send(Ok(samples_to_pcm16(trimmed))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                                 continue;
                             }
                             // Stop sending on silence (model past EOS)
@@ -497,10 +497,10 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                             if speech_chunks > 2 && rms < 0.003 { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                             if rms > 0.01 { speech_chunks += 1; }
                             if !header_sent {
-                                if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { break; }
+                                if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                                 header_sent = true;
                             }
-                            if tx.blocking_send(Ok(samples_to_pcm16(samples))).is_err() { break; }
+                            if tx.blocking_send(Ok(samples_to_pcm16(samples))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                         }
                     })
                 }).collect();

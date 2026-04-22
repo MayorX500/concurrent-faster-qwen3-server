@@ -21,15 +21,26 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 | 8 | 11.49x RT | 0.4s | 11 | ~4GB |
 | 16 | 16.59x RT | 0.3s | 16 | ~5GB |
 
-Streaming TTFA: ~325ms (with voice cloning, preloaded). In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
+Streaming TTFA: ~230ms (with voice cloning, preloaded on L40S). Batched vocoder decode enables 8 concurrent real-time streams per GPU.
 
-### Streaming with Voice Clone (L4, 0.6B)
+### Streaming Concurrent (L40S, 46GB)
+
+| CCU | TTFA | Throughput | Real-time streams |
+|-----|------|-----------|-------------------|
+| 1 | 227ms | 0.9x RT | ✅ |
+| 2 | 240ms | 2.4x RT | ✅ |
+| 4 | 250ms | 4.5x RT | ✅ |
+| 8 | 228ms | 7.5x RT | ✅ |
+| 12 | 2615ms | 6.2x RT | ⚠️ TTFA degrades |
+
+### Streaming with Voice Clone (L40S, 0.6B)
 
 | Phrase | Words | TTFA | Total | Audio | RTF |
 |--------|-------|------|-------|-------|-----|
-| Short | 6 | 331ms | 4.88s | 4.06s | 1.20x |
-| Medium | 17 | 326ms | 6.25s | 4.96s | 1.26x |
-| Long | 27 | 321ms | 7.03s | 5.63s | 1.25x |
+| Medium | 20 | 233ms | 5.12s | 6.31s | 0.81x |
+| Medium | 20 | 230ms | 4.98s | 6.31s | 0.79x |
+| Long | 42 | 231ms | 3.91s | 4.73s | 0.82x |
+| Long | 45 | 232ms | 6.90s | 9.00s | 0.77x |
 
 ### vs other TTS models (L4 24GB)
 
@@ -60,7 +71,7 @@ Full comparison with 29+ models: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALU
 ```bash
 # From GitHub releases
 curl -L -o qwen3-tts-server \
-  "https://github.com/alfonsodg/concurrent-faster-qwen3-server/releases/download/v0.7.1/qwen3-tts-server-v0.7.1-linux-x86_64"
+  "https://github.com/alfonsodg/concurrent-faster-qwen3-server/releases/download/v0.7.5/qwen3-tts-server-v0.7.5-linux-x86_64"
 chmod +x qwen3-tts-server
 ```
 

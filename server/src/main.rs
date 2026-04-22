@@ -96,6 +96,50 @@ struct PreloadResponse {
 
 fn default_language() -> String { "spanish".into() }
 
+/// Split long text into sentences for voice clone (model truncates >25 words).
+/// Only splits when voice_id is present and text exceeds threshold.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    // Split at sentence-ending punctuation
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if matches!(ch, '.' | '!' | '?' | ';' | ':') {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                sentences.push(trimmed);
+            }
+            current.clear();
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        sentences.push(trimmed);
+    }
+    // Further split long sentences at commas
+    let mut result = Vec::new();
+    for s in sentences {
+        if s.split_whitespace().count() > 20 {
+            let mut part = String::new();
+            for ch in s.chars() {
+                part.push(ch);
+                if ch == ',' && part.split_whitespace().count() >= 8 {
+                    let t = part.trim().to_string();
+                    if !t.is_empty() { result.push(t); }
+                    part.clear();
+                }
+            }
+            let t = part.trim().to_string();
+            if !t.is_empty() { result.push(t); }
+        } else {
+            result.push(s);
+        }
+    }
+    result
+}
+
+const SPLIT_WORD_THRESHOLD: usize = 20;
+
 #[derive(Serialize)]
 struct HealthResponse { status: &'static str, queue_depth: usize, max_batch: usize }
 
@@ -233,8 +277,16 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
         state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
         return (status, Json(ErrorResponse { error: msg })).into_response();
     }
+
+    // Auto sentence-split for voice clone with long text
+    let needs_split = req.voice_id.is_some()
+        && req.text.split_whitespace().count() > SPLIT_WORD_THRESHOLD;
+
     if req.stream.unwrap_or(false) {
         state.metrics.requests_streaming.fetch_add(1, Ordering::Relaxed);
+        if needs_split {
+            return synthesize_streaming_split(state, req).await;
+        }
         return synthesize_streaming(state, req).await;
     }
 
@@ -297,6 +349,103 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
     }
 }
 
+
+/// Streaming synthesis with automatic sentence splitting for voice clone.
+/// Generates each sentence separately and streams all chunks sequentially.
+async fn synthesize_streaming_split(state: Arc<AppState>, req: SpeechRequest) -> Response {
+    let t0 = std::time::Instant::now();
+    let sentences = split_sentences(&req.text);
+    if sentences.is_empty() {
+        return synthesize_streaming(state, req).await;
+    }
+
+    let (tx, mut rx) = mpsc::channel::<Result<Vec<u8>, String>>(64);
+
+    // Spawn task to generate each sentence and forward chunks
+    let state2 = state.clone();
+    let voice_id = req.voice_id.clone();
+    let language = req.language.clone();
+    let temperature = req.temperature;
+    tokio::spawn(async move {
+        let mut first = true;
+        for sentence in sentences {
+            let (part_tx, mut part_rx) = mpsc::channel::<Result<Vec<u8>, String>>(32);
+            let part_req = SpeechRequest {
+                text: sentence,
+                language: language.clone(),
+                ref_audio: None,
+                ref_text: None,
+                temperature,
+                stream: Some(true),
+                voice_id: voice_id.clone(),
+            };
+
+            // Resolve voice
+            let cached_prompt = if let Some(vid) = &part_req.voice_id {
+                let hash = hash_bytes(vid.as_bytes());
+                state2.prompt_cache.lock().ok()
+                    .and_then(|c| c.get(&hash).or_else(|| u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h))).cloned())
+            } else { None };
+
+            let stream_req = StreamingRequest {
+                text: part_req.text.clone(),
+                language: parse_language(&part_req.language).unwrap(),
+                temperature: part_req.temperature.unwrap_or(0.7),
+                voice_clone: None,
+                cached_prompt,
+                tx: part_tx,
+            };
+
+            if state2.stream_tx.try_send(stream_req).is_err() {
+                let _ = tx.send(Err("Stream queue full".into())).await;
+                return;
+            }
+
+            // Forward chunks, skip WAV header for subsequent sentences
+            while let Some(chunk) = part_rx.recv().await {
+                match chunk {
+                    Ok(data) => {
+                        if first && data.len() == 44 {
+                            // First sentence WAV header — forward it
+                            if tx.send(Ok(data)).await.is_err() { return; }
+                            first = false;
+                        } else if !first && data.len() == 44 {
+                            // Subsequent sentence WAV header — skip
+                            continue;
+                        } else {
+                            if tx.send(Ok(data)).await.is_err() { return; }
+                            first = false;
+                        }
+                    }
+                    Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                }
+            }
+        }
+    });
+
+    // Wait for first chunk (WAV header)
+    let first_chunk = match rx.recv().await {
+        Some(Ok(data)) => data,
+        Some(Err(e)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })).into_response(); },
+        None => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "No audio".into() })).into_response(); },
+    };
+    let ttfa_ms = t0.elapsed().as_millis();
+
+    let rest = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|r: Result<Vec<u8>, String>| r.map_err(std::io::Error::other));
+    let first_stream = tokio_stream::once(Ok::<Vec<u8>, std::io::Error>(first_chunk));
+    let body = Body::from_stream(first_stream.chain(rest));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "audio/wav")
+        .header("transfer-encoding", "chunked")
+        .header("x-audio-format", "pcm-s16le-24000-mono")
+        .header("x-ttfa-ms", ttfa_ms.to_string())
+        .header("x-sentence-split", "true")
+        .body(body)
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
+}
 async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Response {
     let t0 = std::time::Instant::now();
     let language = parse_language(&req.language).unwrap();

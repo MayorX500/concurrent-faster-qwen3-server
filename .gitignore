@@ -53,3 +53,10 @@ AGENTS.md
 # Vendor test assets
 vendor/qwen3-tts-rs/assets/audio/
 vendor/qwen3-tts-rs/examples/data/
+
+# AGENTS.md compliance
+.cursor/
+target/
+debug/
+reference/
+todo

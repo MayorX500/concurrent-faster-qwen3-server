@@ -889,10 +889,56 @@ impl Qwen3TTS {
         self.decode_tensor(&tensor)
     }
 
-    /// Decode a codes tensor `[1, 16, T]` to audio.
+    /// Decode a codes tensor `[B, 16, T]` to audio.
     fn decode_tensor(&self, codes: &Tensor) -> Result<AudioBuffer> {
         let waveform = self.decoder.decode(codes)?;
         AudioBuffer::from_tensor(waveform, 24000)
+    }
+
+    /// Batched vocoder decode: multiple streams in one GPU pass.
+    /// Each entry is (codes, ctx_frames) where ctx_frames is the number of
+    /// context frames to trim from the output.
+    /// Returns one AudioBuffer per stream (context-trimmed).
+    pub fn decode_codes_batched(&self, entries: &[(&[Vec<u32>], usize)]) -> Result<Vec<AudioBuffer>> {
+        if entries.is_empty() { return Ok(vec![]); }
+        if entries.len() == 1 {
+            let audio = self.decode_codes(entries[0].0)?;
+            let trim = entries[0].1 * (24000 / 12);
+            return Ok(vec![if trim < audio.samples.len() {
+                AudioBuffer::new(audio.samples[trim..].to_vec(), 24000)
+            } else { audio }]);
+        }
+
+        let max_t = entries.iter().map(|(c, _)| c.len()).max().unwrap_or(0);
+        if max_t == 0 { return Ok(vec![]); }
+        let n = entries.len();
+
+        // Build [N, 16, max_t] tensor with zero-padding
+        let mut data = vec![0i64; n * 16 * max_t];
+        let frame_lens: Vec<usize> = entries.iter().map(|(c, _)| c.len()).collect();
+        for (b, (codes, _)) in entries.iter().enumerate() {
+            for (frame, frame_codes) in codes.iter().enumerate() {
+                for (q, &code) in frame_codes.iter().enumerate() {
+                    data[b * 16 * max_t + q * max_t + frame] = code as i64;
+                }
+            }
+        }
+        let tensor = Tensor::from_vec(data, (n, 16, max_t), &self.device)?;
+        let waveform = self.decoder.decode(&tensor)?; // [N, 1, samples]
+
+        let samples_per_frame = 24000 / 12;
+        let mut results = Vec::with_capacity(n);
+        for (i, (_, ctx_frames)) in entries.iter().enumerate() {
+            let wav_i = waveform.i(i)?.squeeze(0)?;
+            let all_samples: Vec<f32> = wav_i.to_vec1()?;
+            // Trim: remove context prefix + padding suffix
+            let trim_start = ctx_frames * samples_per_frame;
+            let trim_end = frame_lens[i] * samples_per_frame;
+            let end = trim_end.min(all_samples.len());
+            let start = trim_start.min(end);
+            results.push(AudioBuffer::new(all_samples[start..end].to_vec(), 24000));
+        }
+        Ok(results)
     }
 
     /// Synthesize speech using a cloned voice, returning raw codes alongside audio.
@@ -1739,19 +1785,26 @@ impl Qwen3TTS {
                 Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
             }
 
-            // Decode and send chunks with fixed vocoder context window
+            // Batched vocoder decode — all active streams in one GPU pass
             if (frame_idx + 1) % chunk_frames == 0 {
+                // Collect decode inputs
+                let mut decode_entries: Vec<(usize, Vec<Vec<u32>>, usize)> = Vec::new();
                 for i in 0..n {
                     if done[i] || frame_buffers[i].is_empty() { continue; }
                     let ctx = &prev_frames[i];
                     let mut decode_input = ctx.clone();
                     decode_input.extend(frame_buffers[i].iter().cloned());
-                    let ctx_samples = ctx.len() * samples_per_frame;
+                    decode_entries.push((i, decode_input, ctx.len()));
+                }
 
-                    if let Ok(audio) = self.decode_codes(&decode_input) {
-                        if ctx_samples < audio.samples.len() {
-                            let mut chunk = audio.samples[ctx_samples..].to_vec();
-                            // Cross-fade with previous chunk tail to eliminate boundary click
+                if !decode_entries.is_empty() {
+                    let batch_refs: Vec<(&[Vec<u32>], usize)> = decode_entries.iter()
+                        .map(|(_, codes, ctx)| (codes.as_slice(), *ctx)).collect();
+                    if let Ok(audios) = self.decode_codes_batched(&batch_refs) {
+                        for (audio, (i, _, _)) in audios.into_iter().zip(decode_entries.iter()) {
+                            let i = *i;
+                            let mut chunk = audio.samples;
+                            // Cross-fade with previous chunk tail
                             let tail = &prev_tail[i];
                             let fade = tail.len().min(chunk.len()).min(crossfade_len);
                             for j in 0..fade {
@@ -1763,17 +1816,21 @@ impl Qwen3TTS {
                                 chunk.truncate(chunk.len() - crossfade_len);
                             }
                             if !chunk.is_empty() {
-                                if senders[i].send(AudioBuffer::new(chunk, audio.sample_rate)).is_err() {
-                                    done[i] = true; // forward thread closed — stop generating
+                                if senders[i].send(AudioBuffer::new(chunk, 24000)).is_err() {
+                                    done[i] = true;
                                 }
                             }
                         }
                     }
-                    // Keep last N frames as context for next chunk
-                    prev_frames[i].extend(frame_buffers[i].drain(..));
-                    let total = prev_frames[i].len();
-                    if total > vocoder_context_frames {
-                        prev_frames[i] = prev_frames[i][total - vocoder_context_frames..].to_vec();
+                }
+                // Update context windows
+                for i in 0..n {
+                    if !frame_buffers[i].is_empty() {
+                        prev_frames[i].extend(frame_buffers[i].drain(..));
+                        let total = prev_frames[i].len();
+                        if total > vocoder_context_frames {
+                            prev_frames[i] = prev_frames[i][total - vocoder_context_frames..].to_vec();
+                        }
                     }
                 }
             }

@@ -3,7 +3,7 @@
 Comparative evaluation of TTS/STT models for call center use cases.
 Focus on Spanish language, voice cloning, concurrent throughput, and L4 24GB deployment.
 
-**Last updated:** 2026-05-05
+**Last updated:** 2026-05-09
 
 ---
 
@@ -14,9 +14,9 @@ Focus on Spanish language, voice cloning, concurrent throughput, and L4 24GB dep
 | **qwen3-tts-server v0.7.4** (ours) | 600M | L4 | ✅ Batch=16 | **16.59x RT** | ✅ ICL + x_vector | ✅ 325ms TTFA | 2.7GB | MIT |
 | OmniVoice 0.6B (k2-fsa) | 600M | L4 | ❌ Sequential | 6.8x RT | ✅ Zero-shot | ❌ | 2.1GB | Apache 2.0 |
 | VoxCPM2 2B (OpenBMB) | 2B | L4 | ✅ Nano-vLLM | 1.0x RT (L4) | ✅ Controllable | ✅ | ~8GB | Apache 2.0 |
+| Supertonic 3 99M | 99M | CPU | ONNX | 6.5x RT (CPU) | ❌ (fixed voices) | ❌ | 0 (CPU) | OpenRAIL |
 | Multilingual-Exp 0.6B | 600M | L4 | ✅ vLLM | 14.1x RT @8 CCU | ✅ (bad accent) | ❌ | 12.2GB | Open |
 | Kokoro 82M | 82M | L4 | ❌ Single | 15x RT | ✅ (via RVC) | ❌ | 0.3GB | Apache 2.0 |
-| Supertonic 2 66M | 66M | CPU | ONNX threads | 68x RT | ❌ (10 fixed) | ❌ | 0 (CPU) | OpenRAIL |
 | Higgs Audio V2 3B | 3B | L40S | ✅ vLLM | 8.0x RT @8 CCU | ✅ Good | ❌ | 38.2GB | Llama |
 | Voxtral 4B | 4B | L40S | ✅ vLLM | 13.5x RT @8 CCU | ❌ | ❌ | 36.9GB | CC-BY-NC |
 
@@ -59,6 +59,7 @@ Call center capacity (10% duty cycle): ~60-80 simultaneous calls on single L4.
 | MOSS-TTS 1.7B | 1.7B | 0.3x RT, 13.4GB VRAM — too slow |
 | MOSS-TTS-Realtime 1.7B | 1.7B | TTFB 180ms but no batching, no serving layer |
 | MOSS-TTS-Nano 100M | 100M | Package broken (pip install fails), API incompatible (2026-05-05) |
+| Supertonic 2 66M | 66M | Superseded by Supertonic 3 (5 langs → 31 langs) |
 | T5Gemma-TTS 4B | 4B | No Spanish (EN/CN/JP only) |
 | Voxtral 4B | 4B | CC-BY-NC license, no voice clone |
 | CosyVoice3 0.5B | 500M | Not realtime (RTF 1.14), incoherent Spanish |
@@ -84,9 +85,11 @@ Call center capacity (10% duty cycle): ~60-80 simultaneous calls on single L4.
 | **Cohere Transcribe 2B** | 2B | 4.5GB | ❌ Fails | ✅ Native | 14.8-43x RT | **Excellent (0 errors simple, 3 errors complex)** | Apache 2.0 |
 | Parakeet TDT 0.6B v2 | 600M | 2.6GB | ❌ Fails | ✅ Native | 199x RT @8 CCU | N/A (EN only) | Apache 2.0 |
 | Parakeet TDT 0.6B v3 | 600M | ~5GB | ? | ✅ Native | 21.6x RT (tested) | Regular (2 grave errors/phrase) | NVIDIA Community |
+| IBM Granite Speech 4.1 2B | 2B | ~5.7GB | ? | ✅ vLLM | 231x RT (leaderboard) | ❌ Unusable (translates to EN, hallucinates) | Apache 2.0 |
 | Qwen3-ASR 0.6B | 900M | 2.2GB | ? | ✅ vLLM | 1-16x RT (tested) | ❌ Unusable (catastrophic errors) | Apache 2.0 |
 | Qwen3-ASR 1.7B | 1.7B | 5GB | ? | ✅ vLLM | 8-13x RT (tested) | ❌ Unusable (catastrophic errors) | Apache 2.0 |
 | GLM-ASR-Nano 1.5B | 1.5B | ~3GB | ? | ✅ | 145x RT (leaderboard) | N/A (EN/ZH/Cantonese only) | MIT |
+| Google MedASR 105M | 105M | ~1GB | ? | ? | ? | N/A (EN only, restrictive license) | Health AI Dev |
 
 ### STT Spanish Clinical Evaluation (2026-05-02, L40S gpux51)
 
@@ -101,6 +104,7 @@ Test audio: espeak-ng es-419, medical terminology, 13-18s clips.
 | faster-whisper | "omeprazole" (anglicized), "día oral" (vía→día) | 2 |
 | Parakeet v3 | "diabetes meícus" (mellitus), "omeprasol" | 2 |
 | Qwen3-ASR 0.6B | "feria de alianzas" (hipertensión arterial) | catastrophic |
+| Granite Speech 4.1 | Translated to English entirely | catastrophic |
 
 **Test 2-5 — Complex terminology (gadolinio, colangiopancreatografía, procalcitonina):**
 
@@ -110,6 +114,9 @@ Test audio: espeak-ng es-419, medical terminology, 13-18s clips.
 | **faster-whisper** | 5 | 2 |
 | Parakeet v3 | 8 | 5 |
 | Qwen3-ASR | Not counted — completely unusable |
+| Granite Speech 4.1 | Not counted — translates to EN or hallucinates |
+
+**Note on LLM-based ASR models (Granite, Qwen3-ASR):** These models achieve excellent benchmark scores on natural speech but fail catastrophically with synthetic audio (espeak-ng). They may perform better with real human voice recordings. Their benchmark WER scores reflect performance on natural speech datasets only.
 
 **Production choices:**
 
@@ -125,6 +132,7 @@ Test audio: espeak-ng es-419, medical terminology, 13-18s clips.
 |----------|-------|-----|-----|
 | **Call center L4 + voice clone** | qwen3-tts-server | L4 | 16.59x RT batch, 1.25x RT streaming clone, 2.7GB, MIT |
 | **Call center L40S** | Higgs Audio V2 3B | L40S | 8x RT @8 CCU, good voice clone, Apache 2.0 |
+| **TTS edge/CPU fallback** | Supertonic 3 | CPU | 6.5x RT, 31 langs, 99M ONNX, no GPU needed |
 | **STT telephony 8kHz** | faster-whisper | L4 | Only robust with 8kHz audio |
 | **STT 16kHz+ clinical** | Cohere Transcribe 2B | L4/L40S | Best Spanish medical accuracy, Apache 2.0 |
 | **STT 16kHz+ high throughput** | Parakeet TDT 0.6B v3 | L4 | 199x RT, 25 EU languages, native punctuation |
@@ -139,3 +147,4 @@ Test audio: espeak-ng es-419, medical terminology, 13-18s clips.
 | MOSS-TTS-Nano 100M | Apache 2.0, 20 langs, CPU, 48kHz | Package broken, API unstable |
 | Higgs Audio V3 STT | Apache 2.0, 94 langs, beats Whisper V3 | boson_multimodal incompatible with transformers 4.47+ |
 | Cohere Transcribe (8kHz) | Would replace faster-whisper if fixed | Fails with telephony 8kHz audio |
+| Granite Speech 4.1 (real voice) | Apache 2.0, 231x RT, keyword biasing | Fails with synthetic audio; needs test with real voice |

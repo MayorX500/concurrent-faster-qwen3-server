@@ -119,7 +119,10 @@ pub fn load_wav<P: AsRef<Path>>(path: P) -> Result<AudioBuffer> {
             .collect::<Result<Vec<_>, _>>()?,
         SampleFormat::Int => {
             let bits = spec.bits_per_sample;
-            let max_val = (1 << (bits - 1)) as f32;
+            if !matches!(bits, 8 | 16 | 24 | 32) {
+                anyhow::bail!("unsupported WAV bits_per_sample: {bits} (supported: 8, 16, 24, 32)");
+            }
+            let max_val = (1i64 << (bits - 1)) as f32;
             reader
                 .into_samples::<i32>()
                 .map(|s| s.map(|v| v as f32 / max_val))

@@ -3,7 +3,7 @@
 Comparative evaluation of TTS/STT models for call center use cases.
 Focus on Spanish language, voice cloning, concurrent throughput, and L4 24GB deployment.
 
-**Last updated:** 2026-05-09
+**Last updated:** 2026-05-17
 
 ---
 
@@ -74,6 +74,8 @@ Call center capacity (10% duty cycle): ~60-80 simultaneous calls on single L4.
 | GLM-TTS (ZhipuAI) | ~1B | MIT, SOTA CER 0.89, but only ZH+EN — no Spanish |
 | Fish Speech V1.5 | 4B | CC-BY-NC-SA-4.0 (non-commercial), exceeds L4 VRAM |
 | Higgs Audio V2.5 1B | 1B | Weights gated (HF 401), Llama license, not self-hosteable |
+| ScenemaAI scenema-audio | ~5B | Not realtime (0.66-1.57x RT), LTX-2 Community license, 12-24GB VRAM |
+| ResembleAI Dramabox 3.3B | 3.3B | English only, LTX-2 Community license, not realtime |
 
 ---
 
@@ -86,6 +88,7 @@ Call center capacity (10% duty cycle): ~60-80 simultaneous calls on single L4.
 | Parakeet TDT 0.6B v2 | 600M | 2.6GB | ❌ Fails | ✅ Native | 199x RT @8 CCU | N/A (EN only) | Apache 2.0 |
 | Parakeet TDT 0.6B v3 | 600M | ~5GB | ? | ✅ Native | 21.6x RT (tested) | Regular (2 grave errors/phrase) | NVIDIA Community |
 | IBM Granite Speech 4.1 2B | 2B | ~5.7GB | ? | ✅ vLLM | 231x RT (leaderboard) | ❌ Unusable (translates to EN, hallucinates) | Apache 2.0 |
+| IBM Granite Speech 4.1 2B NAR | 2B | ~5GB | ? | ✅ Non-AR | 1820x RT (leaderboard) | Not evaluable (requires flash-attn, CUDA mismatch) | Apache 2.0 |
 | Qwen3-ASR 0.6B | 900M | 2.2GB | ? | ✅ vLLM | 1-16x RT (tested) | ❌ Unusable (catastrophic errors) | Apache 2.0 |
 | Qwen3-ASR 1.7B | 1.7B | 5GB | ? | ✅ vLLM | 8-13x RT (tested) | ❌ Unusable (catastrophic errors) | Apache 2.0 |
 | GLM-ASR-Nano 1.5B | 1.5B | ~3GB | ? | ✅ | 145x RT (leaderboard) | N/A (EN/ZH/Cantonese only) | MIT |
@@ -148,3 +151,4 @@ Test audio: espeak-ng es-419, medical terminology, 13-18s clips.
 | Higgs Audio V3 STT | Apache 2.0, 94 langs, beats Whisper V3 | boson_multimodal incompatible with transformers 4.47+ |
 | Cohere Transcribe (8kHz) | Would replace faster-whisper if fixed | Fails with telephony 8kHz audio |
 | Granite Speech 4.1 (real voice) | Apache 2.0, 231x RT, keyword biasing | Fails with synthetic audio; needs test with real voice |
+| Granite Speech 4.1 NAR | Apache 2.0, 1820x RT, non-autoregressive | Requires flash-attn 2 (CUDA mismatch on ai1-aws); same CTC encoder as AR variant |

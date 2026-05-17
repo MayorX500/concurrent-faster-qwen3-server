@@ -223,7 +223,8 @@ async fn preload_embedding(State(state): State<Arc<AppState>>, Json(req): Json<P
 
     // Write temp file, load, encode
     let tmp = std::env::temp_dir().join(format!("preload_{:016x}.wav", rand_u64()));
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
+    if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+        .and_then(|mut f| { use std::io::Write; f.write_all(&bytes) }) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e}") })).into_response();
     }
     let result = (|| -> anyhow::Result<Arc<qwen3_tts::VoiceClonePrompt>> {
@@ -693,7 +694,9 @@ fn decode_ref_audio(req: &SpeechRequest) -> Result<Option<VoiceCloneData>, (Stat
     }
     let tmp = std::env::temp_dir().join(format!("ref_{:016x}{:016x}.wav",
         rand_u64(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64));
-    std::fs::write(&tmp, &bytes).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ref_audio: {e}")))?;
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+        .and_then(|mut f| { use std::io::Write; f.write_all(&bytes) })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ref_audio: {e}")))?;
     // Validate WAV is loadable before accepting (#34)
     if qwen3_tts::AudioBuffer::load(&tmp).is_err() {
         let _ = std::fs::remove_file(&tmp);

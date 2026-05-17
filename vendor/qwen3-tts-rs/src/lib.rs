@@ -148,6 +148,14 @@ pub struct SynthesisTiming {
 
 /// Main TTS interface using proper autoregressive pipeline.
 ///
+
+/// Round up to nearest multiple of 32 to reduce CUDA allocator fragmentation.
+/// Fewer unique tensor sizes = better memory reuse from the caching allocator.
+#[inline]
+fn bucket32(n: usize) -> usize {
+    (n + 31) & !31
+}
+
 /// Supports all 5 Qwen3-TTS model variants. Use [`model_type()`](Self::model_type)
 /// to check which variant was loaded and [`supports_voice_cloning()`](Self::supports_voice_cloning)
 /// / [`supports_preset_speakers()`](Self::supports_preset_speakers) to check capabilities.
@@ -453,7 +461,7 @@ impl Qwen3TTS {
         sync_device(&self.device)?;
         let t_prefill = Instant::now();
 
-        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
+        let mut kv_caches = self.talker.new_kv_caches(bucket32(gen_config.max_new_tokens + 256));
         let (hidden, logits) =
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
@@ -759,7 +767,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
+        let mut kv_caches = self.talker.new_kv_caches(bucket32(gen_config.max_new_tokens + 256));
         let (hidden, logits) =
             self.talker
                 .prefill_custom_voice(&input_ids, speaker, language, &mut kv_caches)?;
@@ -842,7 +850,7 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
+        let mut kv_caches = self.talker.new_kv_caches(bucket32(gen_config.max_new_tokens + 256));
         let (hidden, logits) = self.talker.prefill_voice_design(
             &input_ids,
             &instruct_ids,
@@ -1000,7 +1008,7 @@ impl Qwen3TTS {
             let ref_text_len = prompt.ref_text_ids.as_ref().map(|t| t.len()).unwrap_or(0);
             ref_frames + ref_text_len + input_ids.len() + 16
         } else { 0 };
-        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256 + icl_extra);
+        let mut kv_caches = self.talker.new_kv_caches(bucket32(gen_config.max_new_tokens + 256 + icl_extra));
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
             &speaker_embed,
@@ -1217,7 +1225,7 @@ impl Qwen3TTS {
         }
 
         // Pad all prefill embeddings to the same length
-        let max_prefill_len = prefill_embeds.iter().map(|e| e.dim(1).unwrap_or(0)).max().unwrap_or(0);
+        let max_prefill_len = bucket32(prefill_embeds.iter().map(|e| e.dim(1).unwrap_or(0)).max().unwrap_or(0));
         let hidden_size = prefill_embeds[0].dim(2)?;
 
         let mut padded_embeds: Vec<Tensor> = Vec::with_capacity(n);
@@ -1249,7 +1257,7 @@ impl Qwen3TTS {
         // Phase 2: Batched prefill through transformer
         // Use pre-allocated KV caches with batch=N for zero-copy CUDA writes
         let max_gen = gen_config.max_new_tokens;
-        let mut kv_caches = self.talker.new_kv_caches_batched(n, max_gen + max_prefill_len + 16);
+        let mut kv_caches = self.talker.new_kv_caches_batched(n, bucket32(max_gen + max_prefill_len + 16));
 
         let mut hidden = batched_embed;
         for (i, layer) in self.talker.layers_iter().enumerate() {
@@ -1572,7 +1580,7 @@ impl Qwen3TTS {
         }
 
         // Pad prefills
-        let max_prefill_len = prefill_embeds.iter().map(|e| e.dim(1).unwrap_or(0)).max().unwrap_or(0);
+        let max_prefill_len = bucket32(prefill_embeds.iter().map(|e| e.dim(1).unwrap_or(0)).max().unwrap_or(0));
         let hidden_size = prefill_embeds[0].dim(2)?;
         let mut padded: Vec<Tensor> = Vec::with_capacity(n);
         let mut masks: Vec<Vec<f32>> = Vec::with_capacity(n);
@@ -1597,7 +1605,7 @@ impl Qwen3TTS {
         // Use PreAlloc KV caches to avoid CUDA memory fragmentation from Tensor::cat.
         // Concat caches leak GPU pool memory over many requests with varying lengths.
         let num_layers = self.talker.layers_iter().count();
-        let max_seq = max_prefill_len + gen_config.max_new_tokens + 16;
+        let max_seq = bucket32(max_prefill_len + gen_config.max_new_tokens + 16);
         let dtype = self.compute_dtype;
         let mut kv_caches: Vec<models::transformer::AnyKVCache> = (0..num_layers)
             .map(|_| {

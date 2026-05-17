@@ -436,7 +436,7 @@ impl CodePredictor {
         let seq_len = input.dim(1)?;
         let mask = self.create_causal_mask(seq_len, device)?;
 
-        // Fresh KV caches for batched inference (concat-based)
+        // Reuse concat KV caches — reset before each call to avoid accumulation
         let num_layers = self.layers.len();
         let mut kv_caches: Vec<AnyKVCache> = (0..num_layers)
             .map(|_| AnyKVCache::Concat(super::kv_cache::KVCache::new()))

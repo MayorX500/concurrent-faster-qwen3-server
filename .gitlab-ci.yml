@@ -8,17 +8,79 @@ include:
 stages:
   - check
   - test
-  - build
   - scan
+  - build
+  - release
   - deploy
   - sync
   - security
+  - triage
   - notify
 
+# Set git identity from triggering user (for commits/tags in CI)before_script:  - |    if command -v git > /dev/null 2>&1; then      git config --global user.email "${GITLAB_USER_EMAIL:-bot@labtau.com}"      git config --global user.name "${GITLAB_USER_NAME:-Automation Bot}"    fi
 variables:
   IMAGE_TAG: $CI_REG/$CI_PROJECT_PATH:$CI_COMMIT_TAG
   DOCKER_TLS_CERTDIR: ""
   DOCKER_HOST: unix:///var/run/docker.sock
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.cache/npm"
+  GOPATH: "$CI_PROJECT_DIR/.cache/go"
+
+# ============================================================
+# CACHE TEMPLATES — extend in language-specific jobs
+# ============================================================
+
+.python_cache:
+  cache:
+    key: "${CI_PROJECT_ID}-pip-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cache/pip
+      - .venv/
+    policy: pull-push
+
+.node_cache:
+  cache:
+    key: "${CI_PROJECT_ID}-node-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cache/npm
+      - node_modules/
+    policy: pull-push
+
+.go_cache:
+  cache:
+    key: "${CI_PROJECT_ID}-go-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cache/go
+    policy: pull-push
+
+# ============================================================
+# DEPLOY FREEZE — blocks deploys on weekends and Friday evening
+# ============================================================
+
+.check_deploy_freeze:
+  before_script:
+    - |
+      HOUR=$(TZ=America/Lima date +%H)
+      DOW=$(TZ=America/Lima date +%u)
+      if [ "$DOW" -eq 5 ] && [ "$HOUR" -ge 16 ]; then
+        echo "❌ Deploy blocked: Friday after 4pm (Lima time)"
+        echo "Override: use tag message 'hotfix' to bypass"
+        [ "$CI_COMMIT_TAG_MESSAGE" != "hotfix" ] && exit 1
+      fi
+      if [ "$DOW" -gt 5 ]; then
+        echo "❌ Deploy blocked: Weekend"
+        echo "Override: use tag message 'hotfix' to bypass"
+        [ "$CI_COMMIT_TAG_MESSAGE" != "hotfix" ] && exit 1
+      fi
+
+# Branch-aware allow_failure: strict on develop/main, warn on feature branches
+.strict_on_protected:
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+      when: never
+    - if:  == main ||  == master ||  == develop
+      allow_failure: false
+    - allow_failure: true
 
 # ============================================================
 # CHECK STAGE — linters per language (all allow_failure: true)
@@ -26,17 +88,21 @@ variables:
 
 .python_exists:
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
+    - if: $CI_MERGE_REQUEST_IID
+      exists:
+        - pyproject.toml
+        - requirements.txt
     - exists:
         - pyproject.toml
         - requirements.txt
+      allow_failure: true
 
 ruff:
   stage: check
   image: python:3.14-slim
-  allow_failure: true
-  extends: .python_exists
+  extends:
+    - .python_exists
+    - .python_cache
   script:
     - pip install -q ruff
     - ruff check .
@@ -44,56 +110,66 @@ ruff:
 eslint:
   stage: check
   image: node:24-alpine
-  allow_failure: true
+  extends: .node_cache
   script:
     - npm ci --ignore-scripts
     - npx eslint .
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
     - exists:
         - package.json
 
 go-lint:
   stage: check
   image: golang:1.24-alpine
-  allow_failure: true
+  extends: .go_cache
   script:
     - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
     - golangci-lint run
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
     - exists:
         - go.mod
 
 rust-lint:
   stage: check
   image: rust:1.84-alpine
-  allow_failure: true
   before_script:
     - apk add --no-cache musl-dev
   script:
     - rustup component add clippy
     - cargo clippy -- -D warnings
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
     - exists:
         - Cargo.toml
 
 java-lint:
   stage: check
   image: maven:3.9-eclipse-temurin-21-alpine
-  allow_failure: true
   script:
     - mvn -q compile -DskipTests
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
     - exists:
         - pom.xml
 
+
+shellcheck:
+  stage: check
+  image: koalaman/shellcheck-alpine:stable
+  script:
+    - find . -name "*.sh" -not -path "./.git/*" | xargs shellcheck -S warning
+  rules:
+    - exists:
+        - "*.sh"
+        - scripts/*.sh
+        - lib/*.sh
+
+danger-review:
+  stage: check
+  image: node:24-alpine
+  extends: .node_cache
+  script:
+    - npx --yes danger ci --failOnErrors
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
 # ============================================================
 # TEST STAGE — auto-detect test framework, with coverage
 # ============================================================
@@ -101,7 +177,7 @@ java-lint:
 pytest:
   stage: test
   image: python:3.14-slim
-  allow_failure: true
+  extends: .python_cache
   before_script:
     - |
       if [ -f "pyproject.toml" ]; then
@@ -122,16 +198,19 @@ pytest:
       - coverage-html/
     expire_in: 7 days
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
+    - if: $CI_MERGE_REQUEST_IID
+      exists:
+        - tests/
+        - test/
     - exists:
         - tests/
         - test/
+      allow_failure: true
 
 vitest:
   stage: test
   image: node:24-alpine
-  allow_failure: true
+  extends: .node_cache
   script:
     - npm ci --ignore-scripts
     - npx vitest run --coverage || true
@@ -145,8 +224,6 @@ vitest:
       - coverage/
     expire_in: 7 days
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
     - exists:
         - vitest.config.ts
         - vitest.config.js
@@ -157,11 +234,11 @@ vitest:
 # ============================================================
 
 changelog:
-  stage: build
+  stage: release
   image: alpine:latest
   script:
     - apk add --no-cache git curl
-    - curl -sSL https://github.com/orhun/git-cliff/releases/latest/download/git-cliff-x86_64-unknown-linux-musl.tar.gz | tar xz
+    - VERSION=$(curl -sI https://github.com/orhun/git-cliff/releases/latest 2>/dev/null | grep -i location | sed "s/.*tag\/v/v/" | tr -d "\r\n") && curl -sSL "https://github.com/orhun/git-cliff/releases/download/${VERSION}/git-cliff-${VERSION#v}-x86_64-unknown-linux-musl.tar.gz" | tar xz --strip-components=1
     - ./git-cliff -o CHANGELOG.md --tag $CI_COMMIT_TAG
     - echo "Generated changelog for $CI_COMMIT_TAG"
     - cat CHANGELOG.md | head -30
@@ -169,18 +246,27 @@ changelog:
     paths:
       - CHANGELOG.md
     expire_in: 90 days
+  allow_failure: true
   rules:
     - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
 
 build-container:
   stage: build
   image: docker:27
+  variables:
+    IMAGE_TAG: ${CI_REG}/${CI_PROJECT_PATH}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
   script:
     - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
     - docker build -t $IMAGE_TAG -f Dockerfile .
     - docker push $IMAGE_TAG
+    - if [ "$CI_COMMIT_BRANCH" = "develop" ]; then docker tag $IMAGE_TAG ${CI_REG}/${CI_PROJECT_PATH}:dev-latest && docker push ${CI_REG}/${CI_PROJECT_PATH}:dev-latest; fi
+    - if [ "$CI_COMMIT_BRANCH" = "main" ] || [ "$CI_COMMIT_BRANCH" = "master" ]; then docker tag $IMAGE_TAG ${CI_REG}/${CI_PROJECT_PATH}:latest && docker push ${CI_REG}/${CI_PROJECT_PATH}:latest; fi
+    - if [ -n "$CI_COMMIT_TAG" ]; then docker tag $IMAGE_TAG ${CI_REG}/${CI_PROJECT_PATH}:${CI_COMMIT_TAG} && docker push ${CI_REG}/${CI_PROJECT_PATH}:${CI_COMMIT_TAG}; fi
   rules:
-    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE == "deploy"
+      when: never
+    - exists:
+        - Dockerfile
   retry:
     max: 2
     when: runner_system_failure
@@ -190,20 +276,31 @@ build-container:
 # ============================================================
 
 trivy-scan:
-  stage: scan
+  stage: build
   image: docker:27
-  allow_failure: true
+  variables:
+    IMAGE_TAG: ${CI_REG}/${CI_PROJECT_PATH}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
   script:
     - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
-    - docker run --rm
-        -v /var/run/docker.sock:/var/run/docker.sock
-        aquasec/trivy:latest image
-        --severity HIGH,CRITICAL
-        --exit-code 0
-        --format table
-        $IMAGE_TAG
+    - apk add --no-cache jq curl
+    - |
+      docker run --rm -v /var/run/docker.sock:/var/run/docker.sock         aquasec/trivy:latest image --severity HIGH,CRITICAL --format json         $IMAGE_TAG > /tmp/trivy.json 2>/dev/null || true
+      VULNS=$(jq '[.Results[]?.Vulnerabilities[]?] | length' /tmp/trivy.json 2>/dev/null || echo 0)
+      echo "HIGH/CRITICAL vulnerabilities: $VULNS"
+      if [ "$VULNS" -gt "0" ]; then
+        VULN_LIST=$(jq -r '.Results[]?.Vulnerabilities[]? | "- **\(.Severity)** \(.VulnerabilityID) (\(.PkgName)): \(.Title)"' /tmp/trivy.json | head -15)
+        TITLE="[Trivy] $VULNS vulnerabilities: ${CI_PROJECT_NAME} (${CI_COMMIT_REF_NAME})"
+        BODY="## Security Scan\n\n**Project:** ${CI_PROJECT_PATH}\n**Ref:** ${CI_COMMIT_REF_NAME}\n**Image:** $IMAGE_TAG\n**Pipeline:** ${CI_PIPELINE_URL}\n\n### Vulnerabilities\n\n${VULN_LIST}\n\n### Fix\nUpdate packages and rebuild."
+        curl -s -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}"           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues"           --data-urlencode "title=$TITLE"           --data-urlencode "description=$BODY"           -d "labels=type::security,priority::high,auto-generated" && echo "Issue created"
+        exit 1
+      fi
   rules:
-    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
+    - if: $CI_MERGE_REQUEST_IID
+      exists:
+        - Dockerfile
+    - exists:
+        - Dockerfile
+      allow_failure: true
   needs:
     - build-container
 
@@ -212,7 +309,6 @@ sonarqube:
   image:
     name: sonarsource/sonar-scanner-cli:latest
     entrypoint: [""]
-  allow_failure: true
   variables:
     GIT_DEPTH: 0
   script:
@@ -222,13 +318,18 @@ sonarqube:
         -Dsonar.sources=.
         -Dsonar.host.url=${SONAR_HOST_URL}
         -Dsonar.token=${SONAR_TOKEN}
-        -Dsonar.qualitygate.wait=false
+        -Dsonar.qualitygate.wait=${SONAR_WAIT:-false}
         -Dsonar.scm.provider=git
         -Dsonar.gitlab.project_id=${CI_PROJECT_ID}
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
-    - if: $SONAR_TOKEN && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")
+    - if: $SONAR_TOKEN && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master")
+      allow_failure: false
+      variables:
+        SONAR_WAIT: "true"
+    - if: $SONAR_TOKEN && $CI_COMMIT_BRANCH == "develop"
+      allow_failure: true
+    - if: $SONAR_TOKEN
+      allow_failure: true
 
 import_sonar_issues:
   stage: security
@@ -238,46 +339,53 @@ import_sonar_issues:
     - apk add --no-cache curl jq
     - |
       PROJECT_KEY="${CI_PROJECT_PATH_SLUG}"
-      PAGE=1
-      CREATED=0
-      SKIPPED=0
-      while true; do
-        RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" \
-          "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&resolved=false&severities=BLOCKER,CRITICAL&types=BUG,VULNERABILITY&ps=100&p=${PAGE}")
-        TOTAL=$(echo "$RESPONSE" | jq -r '.total')
-        [ "$TOTAL" = "0" ] && echo "No BLOCKER/CRITICAL issues found" && exit 0
-        echo "$RESPONSE" | jq -c '.issues[]' | while read -r ISSUE; do
-          RULE=$(echo "$ISSUE" | jq -r '.rule')
-          MSG=$(echo "$ISSUE" | jq -r '.message')
-          SEV=$(echo "$ISSUE" | jq -r '.severity')
-          TYPE=$(echo "$ISSUE" | jq -r '.type')
-          FILE=$(echo "$ISSUE" | jq -r '.component' | sed "s|${PROJECT_KEY}:||")
-          LINE=$(echo "$ISSUE" | jq -r '.line // "?"')
-          TITLE="[SonarQube ${SEV}] ${TYPE}: ${MSG}"
-          TITLE_SHORT=$(echo "$TITLE" | head -c 200)
-          EXISTING=$(curl -s -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
-            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues?search=$(echo "$RULE" | jq -Rr @uri)&state=opened&per_page=1" | jq 'length')
-          if [ "$EXISTING" -gt 0 ]; then
-            SKIPPED=$((SKIPPED + 1))
-            continue
-          fi
-          BODY="## SonarQube Finding\n\n- **Rule**: ${RULE}\n- **Severity**: ${SEV}\n- **Type**: ${TYPE}\n- **File**: \`${FILE}:${LINE}\`\n- **Message**: ${MSG}\n\n[View in SonarQube](${SONAR_HOST_URL}/project/issues?id=${PROJECT_KEY}&open=$(echo "$ISSUE" | jq -r '.key'))"
-          curl -s -o /dev/null -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
-            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues" \
-            --data-urlencode "title=${TITLE_SHORT}" \
-            --data-urlencode "description=${BODY}" \
-            -d "labels=sonarqube,auto-generated,priority::high"
-          CREATED=$((CREATED + 1))
-        done
-        PAGES=$(( (TOTAL + 99) / 100 ))
-        [ "$PAGE" -ge "$PAGES" ] && break
-        PAGE=$((PAGE + 1))
+      RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&resolved=false&severities=BLOCKER,CRITICAL&types=BUG,VULNERABILITY&ps=20")
+      # Validate JSON
+      echo "$RESPONSE" | jq empty 2>/dev/null || { echo "SonarQube API returned invalid JSON"; exit 0; }
+      TOTAL=$(echo "$RESPONSE" | jq -r '.total // 0')
+      echo "Found $TOTAL BLOCKER/CRITICAL issues"
+      [ "$TOTAL" = "0" ] && exit 0
+      echo "$RESPONSE" | jq -c '.issues[]' | while read -r ISSUE; do
+        RULE=$(echo "$ISSUE" | jq -r '.rule')
+        MSG=$(echo "$ISSUE" | jq -r '.message' | head -c 100)
+        SEV=$(echo "$ISSUE" | jq -r '.severity')
+        TYPE=$(echo "$ISSUE" | jq -r '.type')
+        FILE=$(echo "$ISSUE" | jq -r '.component' | sed "s|${PROJECT_KEY}:||")
+        LINE=$(echo "$ISSUE" | jq -r 'if .line then .line else "?" end')
+        PRIORITY="priority::high"
+        [ "$SEV" = "BLOCKER" ] && PRIORITY="priority::critical"
+        TYPE_LABEL="type::bug"
+        [ "$TYPE" = "VULNERABILITY" ] && TYPE_LABEL="type::security"
+        TITLE="[SonarQube] ${SEV}: ${MSG}"
+        # Check if issue already exists
+        EXISTING=$(curl -s -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}"           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues?search=${RULE}&state=opened&per_page=1" | jq length)
+        if [ "$EXISTING" = "0" ]; then
+          BODY="## SonarQube Issue\n\n**Rule:** ${RULE}\n**Severity:** ${SEV}\n**Type:** ${TYPE}\n**File:** ${FILE}:${LINE}\n**Message:** ${MSG}"
+          curl -s -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}"             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues"             --data-urlencode "title=${TITLE}"             --data-urlencode "description=${BODY}"             -d "labels=${TYPE_LABEL},${PRIORITY},auto-generated" > /dev/null
+          echo "  Created: $TITLE"
+        fi
       done
-      echo "Created: ${CREATED}, Skipped (duplicates): ${SKIPPED}"
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
     - if: $SONAR_TOKEN && $CI_PERSONAL_TOKEN && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")
+    - if: $SONAR_TOKEN && $CI_PERSONAL_TOKEN && $CI_COMMIT_TAG
+
+# ============================================================
+# RELEASE STAGE — create GitLab Release with changelog
+# ============================================================
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - echo "Creating release for $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Release $CI_COMMIT_TAG"
+    description: ./CHANGELOG.md
+  needs:
+    - changelog
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
 
 # --- K8s manifests generation (for client clusters like Huawei CCE) ---
 generate-k8s-manifests:
@@ -303,26 +411,121 @@ generate-k8s-manifests:
         - k8s/
 
 # ============================================================
-# DEPLOY STAGE — SSH deploy + health check
+# DEPLOY STAGE — SSH deploy + health check + freeze check
 # ============================================================
 
+# Deploy staging (develop branch)
+deploy-staging:
+  stage: deploy
+  image: alpine:latest
+  environment:
+    name: staging
+    url: $STAGING_HEALTH_URL
+  script:
+    - |
+      apk add --no-cache openssh-client curl
+      eval $(ssh-agent -s)
+      echo "$DEPLOY_SSH_KEY" | tr -d '
+      ' | ssh-add -
+      mkdir -p ~/.ssh && ssh-keyscan -H "$STAGING_HOST" >> ~/.ssh/known_hosts
+      export TAG=${CI_REG}/${CI_PROJECT_PATH}:dev-latest
+      case "${DEPLOY_MODE:-standalone}" in
+      standalone)
+      ssh $DEPLOY_USER@$STAGING_HOST "docker pull $TAG && docker compose -f $COMPOSE_PATH pull && docker compose -f $COMPOSE_PATH up -d"
+      ;;
+      swarm)
+      ssh $DEPLOY_USER@$STAGING_HOST "docker service update --image $TAG $SERVICE_NAME"
+      ;;
+      k8s)
+      ssh $DEPLOY_USER@$STAGING_HOST "kubectl set image deployment/$SERVICE_NAME $SERVICE_NAME=$TAG -n $K8S_NAMESPACE"
+      ;;
+      esac
+      if [ -n "$STAGING_HEALTH_URL" ]; then
+      sleep 10
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_HEALTH_URL")
+      [ "$STATUS" = "200" ] && echo "✅ Staging health OK" || echo "⚠️ Health: $STATUS"
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop" && $STAGING_HOST
+
+# Deploy production (main/master merge or tag)
 deploy-production:
   stage: deploy
   image: alpine:latest
+  extends: .check_deploy_freeze
+  environment:
+    name: production
+    url: $PRODUCTION_HEALTH_URL
   script:
-    - apk add --no-cache openssh-client curl
-    - eval $(ssh-agent -s)
-    - echo "$REMOTE_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
-    - mkdir -p ~/.ssh && ssh-keyscan -H "$REMOTE_IP" >> ~/.ssh/known_hosts
-    - ssh $REMOTE_USER@$REMOTE_IP "docker service update --update-parallelism 1 --update-delay 10s --update-failure-action=rollback --image $IMAGE_TAG $REMOTE_SERVICE"
     - |
-      if [ -n "$HEALTH_URL" ]; then
-        sleep 10
-        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL")
-        [ "$STATUS" = "200" ] && echo "✅ Health check passed" || echo "⚠️ Health check returned $STATUS"
+      apk add --no-cache openssh-client curl
+      eval $(ssh-agent -s)
+      echo "$DEPLOY_SSH_KEY" | tr -d '
+      ' | ssh-add -
+      mkdir -p ~/.ssh && ssh-keyscan -H "$PRODUCTION_HOST" >> ~/.ssh/known_hosts
+      export TAG=${CI_REG}/${CI_PROJECT_PATH}:${CI_COMMIT_SHORT_SHA}
+      case "${DEPLOY_MODE:-standalone}" in
+      standalone)
+      ssh $DEPLOY_USER@$PRODUCTION_HOST "docker pull $TAG && docker compose -f $COMPOSE_PATH pull && docker compose -f $COMPOSE_PATH up -d"
+      ;;
+      swarm)
+      ssh $DEPLOY_USER@$PRODUCTION_HOST "docker service update --update-parallelism 1 --update-delay 10s --update-failure-action=rollback --image $TAG $SERVICE_NAME"
+      ;;
+      k8s)
+      ssh $DEPLOY_USER@$PRODUCTION_HOST "kubectl set image deployment/$SERVICE_NAME $SERVICE_NAME=$TAG -n $K8S_NAMESPACE --record"
+      ;;
+      esac
+      if [ -n "$PRODUCTION_HEALTH_URL" ]; then
+      sleep 10
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_HEALTH_URL")
+      [ "$STATUS" = "200" ] && echo "✅ Production health OK" || (echo "❌ Health FAILED: $STATUS" && exit 1)
       fi
   rules:
-    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+    - if: ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master") && $PRODUCTION_HOST
+    - if: $CI_COMMIT_TAG_MESSAGE == "deploy" && $PRODUCTION_HOST
+
+eas-update:
+  stage: deploy
+  image: node:24-alpine
+  extends: .node_cache
+  before_script:
+    - apk add --no-cache bash
+    - npm ci --cache .npm
+  script:
+    - npx eas-cli update --branch production --non-interactive --message "$CI_COMMIT_MESSAGE"
+  rules:
+    - if: $EXPO_TOKEN && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      exists:
+        - app.json
+        - eas.json
+  allow_failure: true
+
+auto-tag:
+  stage: release
+  image: alpine:latest
+  script:
+    - apk add --no-cache git curl
+    - |
+      LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+      MAJOR=$(echo $LAST_TAG | sed 's/v//' | cut -d. -f1)
+      MINOR=$(echo $LAST_TAG | sed 's/v//' | cut -d. -f2)
+      PATCH=$(echo $LAST_TAG | sed 's/v//' | cut -d. -f3)
+      if git log $LAST_TAG..HEAD --oneline | grep -qiE 'BREAKING|!:'; then
+        MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+      elif git log $LAST_TAG..HEAD --oneline | grep -qiE '^[a-f0-9]+ feat'; then
+        MINOR=$((MINOR + 1)); PATCH=0
+      else
+        PATCH=$((PATCH + 1))
+      fi
+      NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+      echo "Tagging: $LAST_TAG → $NEW_TAG"
+      curl -s -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
+        -d "tag_name=$NEW_TAG&ref=$CI_COMMIT_SHA&message=Auto-release $NEW_TAG" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PERSONAL_TOKEN
+  allow_failure: true
+
 
 # ============================================================
 # SYNC STAGE — push to gitlab.com for security scanning
@@ -357,16 +560,17 @@ import_security_issues:
       PROJECT_PATH="${GITLAB_CLOUD_GROUP:-ccvass}/${CI_PROJECT_NAME}"
       ENCODED_PATH=$(echo "$PROJECT_PATH" | sed 's|/|%2F|g')
 
-      EXISTING=$(curl -s -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
-        "https://scovil.labtau.com/api/v4/projects/$CI_PROJECT_ID/issues?labels=security,auto-generated&per_page=100" \
-        | jq -r '.[].title')
-
       curl -s -H "PRIVATE-TOKEN: $GITLAB_COM_TOKEN" \
         "https://gitlab.com/api/v4/projects/${ENCODED_PATH}/vulnerability_findings?severity=critical,high&per_page=100" \
         | jq -c '.[]?' | while read -r vuln; do
         TITLE=$(echo "$vuln" | jq -r '"[\(.severity)] \(.name)"')
+        VULN_ID=$(echo "$vuln" | jq -r '.uuid // .id // empty' | head -c 8)
 
-        if echo "$EXISTING" | grep -qF "$TITLE"; then
+        # Deduplicate by exact title match (not substring)
+        EXISTING=$(curl -s -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues?labels=type::security,auto-generated&search=$(echo "$TITLE" | head -c 50 | jq -Rr @uri)&per_page=5" \
+          | jq -r '.[].title')
+        if echo "$EXISTING" | grep -qxF "$TITLE"; then
           echo "⏭️ $TITLE (exists)"
           continue
         fi
@@ -375,16 +579,108 @@ import_security_issues:
 
         curl -s --request POST \
           --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
-          "https://scovil.labtau.com/api/v4/projects/$CI_PROJECT_ID/issues" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues" \
           --data-urlencode "title=$TITLE" \
           --data-urlencode "description=$DESC" \
-          --data "labels=security,auto-generated" > /dev/null
+          --data "labels=type::security,priority::high,auto-generated" > /dev/null
         echo "✅ $TITLE"
       done
   rules:
     - if: $CI_SERVER_HOST == "scovil.labtau.com" && $CI_COMMIT_BRANCH == "main"
       when: delayed
       start_in: 5 minutes
+  allow_failure: true
+
+# ============================================================
+# TRIAGE STAGE — stale issues, token alerts, compliance
+# ============================================================
+
+triage:
+  stage: triage
+  image: ruby:3.3-alpine
+  script:
+    - gem install gitlab-triage --no-document
+    - gitlab-triage
+        --token "$CI_PERSONAL_TOKEN"
+        --host-url "https://scovil.labtau.com"
+        --source-id "$CI_PROJECT_NAMESPACE"
+        --source groups
+        --policies-file .triage-policies.yml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  allow_failure: true
+
+check-token-expiry:
+  stage: triage
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl jq
+    - |
+      THRESHOLD=$(date -d "+14 days" +%Y-%m-%d 2>/dev/null || date -v+14d +%Y-%m-%d)
+      echo "Checking tokens expiring before $THRESHOLD"
+      EXPIRING=$(curl -s -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
+        "https://scovil.labtau.com/api/v4/personal_access_tokens?state=active&per_page=100" \
+        | jq -r --arg d "$THRESHOLD" \
+        '.[] | select(.expires_at != null and .expires_at <= $d) | "⚠️ \(.name) (id:\(.id)) expires \(.expires_at)"')
+      if [ -n "$EXPIRING" ]; then
+        echo "🔑 Tokens expiring within 14 days:"
+        echo "$EXPIRING"
+        # Create issue if not exists
+        TITLE="[Auto] Tokens expiring soon - $(date +%Y-%m-%d)"
+        EXISTING=$(curl -s -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues?search=Tokens+expiring+soon&state=opened&per_page=1" | jq 'length')
+        if [ "$EXISTING" -eq 0 ]; then
+          curl -s -X POST -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues" \
+            --data-urlencode "title=$TITLE" \
+            --data-urlencode "description=## Tokens Expiring Soon\n\n$EXPIRING\n\nRotate these tokens before they expire." \
+            -d "labels=security,auto-generated,priority::high" > /dev/null
+          echo "📋 Issue created"
+        fi
+      else
+        echo "✅ No tokens expiring within 14 days"
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  allow_failure: true
+
+compliance-check:
+  stage: triage
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl jq
+    - |
+      echo "# Project Compliance Report" > compliance-report.md
+      echo "Generated: $(date -Iseconds)" >> compliance-report.md
+      echo "" >> compliance-report.md
+      TOTAL=0; PASS=0; FAIL=0
+      for PAGE in 1 2 3; do
+        curl -s -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
+          "https://scovil.labtau.com/api/v4/groups/248/projects?include_subgroups=true&archived=false&per_page=100&page=$PAGE" \
+          | jq -c '.[]' | while read -r proj; do
+          NAME=$(echo "$proj" | jq -r '.path_with_namespace')
+          TOPICS=$(echo "$proj" | jq -r '.topics | length')
+          README=$(echo "$proj" | jq -r '.readme_url // empty')
+          DESC=$(echo "$proj" | jq -r '.description // empty')
+          ISSUES=""
+          [ -z "$README" ] && ISSUES="${ISSUES}- ❌ No README\n"
+          [ "$TOPICS" -eq 0 ] && ISSUES="${ISSUES}- ❌ No topics\n"
+          [ -z "$DESC" ] && ISSUES="${ISSUES}- ⚠️ No description\n"
+          if [ -n "$ISSUES" ]; then
+            echo "⚠️ $NAME" >> compliance-report.md
+            printf "$ISSUES\n" >> compliance-report.md
+          fi
+        done
+      done
+      echo ""
+      echo "Report saved to compliance-report.md"
+      cat compliance-report.md | head -50
+  artifacts:
+    paths:
+      - compliance-report.md
+    expire_in: 30 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
   allow_failure: true
 
 # ============================================================
@@ -397,23 +693,296 @@ notify-failure:
   script:
     - apk add --no-cache curl
     - |
+      if [ -n "$GITLAB_USER_EMAIL" ] && [ -n "$CI_PERSONAL_TOKEN" ]; then
+        SUBJECT="[GitLab] MR Pipeline Failed: ${CI_PROJECT_NAME} (${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME})"
+        BODY="Pipeline FAILED.\nProject: ${CI_PROJECT_PATH}\nBranch: ${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME} -> ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}\nFailed: ${FAILED_JOBS}\nPipeline: ${CI_PIPELINE_URL}"
+        printf "To: ${GITLAB_USER_EMAIL}\nFrom: webmaster@labtau.com\nSubject: ${SUBJECT}\n\n${BODY}" | sendmail -t 2>/dev/null || true
+      fi
+    - |
       if [ -n "$SLACK_WEBHOOK_URL" ]; then
         curl -s -X POST "$SLACK_WEBHOOK_URL" \
           -H "Content-Type: application/json" \
           -d "{\"text\":\"❌ Pipeline failed: *${CI_PROJECT_PATH}* (${CI_COMMIT_REF_NAME})\nJob: ${CI_JOB_NAME}\nURL: ${CI_PIPELINE_URL}\"}"
       fi
     - |
+      FAILED_JOBS=$(curl -s -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs?scope=failed" | \
+        jq -r '.[].name' 2>/dev/null | grep -v notify | sort -u | tr '\n' ', ' | sed 's/,$//')
+      [ -z "$FAILED_JOBS" ] && FAILED_JOBS="unknown"
+    - |
       if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        MSG="\u274c *MR Pipeline FAILED*%0A%0A\U0001f4e6 *Project:* ${CI_PROJECT_PATH}%0A\U0001f500 *Branch:* ${CI_COMMIT_REF_NAME} \u2192 ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}%0A\u26a0\ufe0f *Failed jobs:* ${FAILED_JOBS}%0A\U0001f517 [Ver pipeline](${CI_PIPELINE_URL})"
         curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
           -d "chat_id=${TELEGRAM_CHAT_ID}" \
           -d "parse_mode=Markdown" \
-          -d "text=❌ *Pipeline failed*%0A📦 ${CI_PROJECT_PATH}%0A🔀 ${CI_COMMIT_REF_NAME}%0A🔗 [Ver pipeline](${CI_PIPELINE_URL})"
+          -d "text=${MSG}"
       fi
   rules:
-    - if: $CI_COMMIT_TAG
-      when: never
-    - when: on_failure
+    - if: $CI_MERGE_REQUEST_IID
+      when: on_failure
   allow_failure: true
+
+# ============================================================
+# PAGES — publish coverage reports and docs
+# ============================================================
+
+pages:
+  stage: notify
+  image: alpine:latest
+  script:
+    - mkdir -p public
+    - cp -r coverage-html/* public/ 2>/dev/null || true
+    - echo "<h1>Project Pages</h1><p>Coverage report available if tests ran.</p>" > public/index.html 2>/dev/null || true
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      exists:
+        - tests/
+        - test/
+        - src/
+  needs:
+    - job: pytest
+      optional: true
+    - job: vitest
+      optional: true
+  allow_failure: true
+
+# ============================================================
+# AUTO-DETECT STACK — runs automatically based on project files
+# ============================================================
+
+validate-openapi:
+  stage: check
+  image: python:3.14-slim
+  script:
+    - pip install -q openapi-spec-validator
+    - |
+      for f in openapi.json openapi.yaml docs/openapi.json; do
+        [ -f "$f" ] && python -m openapi_spec_validator "$f" && echo "✅ $f valid"
+      done
+  rules:
+    - exists:
+        - openapi.json
+        - openapi.yaml
+        - docs/openapi.json
+
+migration-check:
+  stage: check
+  image: python:3.14-slim
+  script:
+    - pip install -q uv 2>/dev/null && uv sync 2>/dev/null || pip install -q -r requirements.txt 2>/dev/null || true
+    - pip install -q alembic 2>/dev/null || true
+    - |
+      if command -v alembic >/dev/null 2>&1; then
+        alembic check 2>/dev/null && echo "✅ No pending migrations" || echo "⚠️ Pending migrations"
+      fi
+  rules:
+    - exists:
+        - alembic.ini
+
+typecheck:
+  stage: check
+  image: node:24-alpine
+  extends: .node_cache
+  script:
+    - npm ci --ignore-scripts
+    - npx tsc --noEmit
+  rules:
+    - exists:
+        - tsconfig.json
+
+build-frontend:
+  stage: build
+  image: node:24-alpine
+  extends: .node_cache
+  allow_failure: true
+  script:
+    - npm ci --ignore-scripts
+    - npm run build
+    - |
+      if [ -d ".next" ]; then du -sh .next/;
+      elif [ -d "dist" ]; then du -sh dist/;
+      fi
+  artifacts:
+    paths:
+      - dist/
+      - .next/
+      - build/
+    expire_in: 7 days
+  rules:
+    - exists:
+        - next.config.js
+        - next.config.ts
+        - next.config.mjs
+        - vite.config.ts
+        - vite.config.js
+
+validate-compose:
+  stage: check
+  image: docker:27
+  script:
+    - |
+      FILES=$(find deploy/ -name "docker-compose*.yml" -o -name "compose*.yml" -o -name "compose*.yaml" 2>/dev/null)
+      if [ -z "$FILES" ]; then echo "No compose files in deploy/"; exit 0; fi
+      echo "$FILES" | while read f; do
+        docker compose -f "$f" config --quiet && echo "$f valid" || (echo "$f INVALID" && exit 1)
+      done
+    - |
+      if [ -d "deploy/helm" ] && [ -f "deploy/helm/Chart.yaml" ]; then
+        grep -q "apiVersion" deploy/helm/Chart.yaml && echo "Helm Chart.yaml valid" || (echo "Chart.yaml INVALID" && exit 1)
+      fi
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+      when: never
+    - exists:
+        - deploy/compose/docker-compose.yml
+        - deploy/compose/docker-compose.yaml
+        - deploy/compose/compose.yml
+        - deploy/helm/Chart.yaml
+
+
+# ============================================================
+# MOBILE — Expo/React Native (auto-detected by app.json)
+# ============================================================
+
+expo-doctor:
+  stage: check
+  image: node:24-alpine
+  extends: .node_cache
+  script:
+    - npm ci --cache .npm
+    - npx expo-doctor
+  rules:
+    - exists:
+        - app.json
+        - app.config.js
+
+# EAS Build (cloud) — primary mobile build strategy
+build-apk-eas:
+  stage: build
+  image: node:24-alpine
+  extends: .node_cache
+  before_script:
+    - apk add --no-cache bash curl jq git
+    - npm ci --cache .npm
+  script:
+    - |
+      echo "Configuring EAS project..."
+      npx eas-cli init --non-interactive --force 2>/dev/null || true
+      echo "Starting EAS Build..."
+      OUTPUT=$(npx eas-cli build --platform android --profile preview --non-interactive --wait 2>&1) || true
+      echo "$OUTPUT"
+      # Check for quota exhaustion
+      if echo "$OUTPUT" | grep -qi "limit\|quota\|exceeded\|upgrade.*plan"; then
+        echo "EAS_QUOTA_EXHAUSTED=true" > eas_status.env
+        echo "⚠️ EAS quota exhausted. Docker fallback will run."
+        exit 10
+      fi
+      # Check for build error
+      if echo "$OUTPUT" | grep -qi "error\|failed\|Error:"; then
+        echo "EAS_BUILD_ERROR=true" > eas_status.env
+        # Create issue with error details
+        TITLE="[EAS Build] Build failed: ${CI_PROJECT_NAME} (${CI_COMMIT_REF_NAME})"
+        BODY="## EAS Build Failure\n\n**Project:** ${CI_PROJECT_PATH}\n**Branch:** ${CI_COMMIT_REF_NAME}\n**Pipeline:** ${CI_PIPELINE_URL}\n\n### Error Output\n\n\`\`\`\n$(echo "$OUTPUT" | tail -20)\n\`\`\`\n\n### Action Required\n\nFix the build error and push again to retrigger."
+        curl -s -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues" \
+          --data-urlencode "title=$TITLE" \
+          --data-urlencode "description=$BODY" \
+          -d "labels=type::bug,priority::high,auto-generated"
+        echo "❌ Issue created for build error."
+        exit 1
+      fi
+      echo "✅ EAS Build submitted successfully."
+      echo "EAS_SUCCESS=true" > eas_status.env
+  artifacts:
+    reports:
+      dotenv: eas_status.env
+    when: always
+  rules:
+    - if: $EXPO_TOKEN
+      exists:
+        - eas.json
+  allow_failure:
+    exit_codes: [10]
+
+# Docker APK build — fallback ONLY when EAS quota exhausted
+build-apk-docker:
+  tags:
+    - android
+  stage: build
+  image: reactnativecommunity/react-native-android:latest
+  variables:
+    GRADLE_USER_HOME: "${CI_PROJECT_DIR}/.gradle"
+  before_script:
+    - npm ci --legacy-peer-deps
+    - npx expo prebuild --platform android --no-install 2>/dev/null || true
+  script:
+    - cd android && ./gradlew assembleRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseG1GC"
+    - echo "✅ APK built locally"
+  artifacts:
+    paths:
+      - android/app/build/outputs/apk/release/*.apk
+    expire_in: 30 days
+  needs:
+    - job: build-apk-eas
+      optional: true
+      artifacts: true
+  rules:
+    - exists:
+        - app.json
+  when: on_failure
+
+# Web build — containerized (for projects with web platform)
+build-web:
+  stage: build
+  image: node:24-alpine
+  extends: .node_cache
+  script:
+    - npm ci --cache .npm
+    - npx expo export --platform web
+    - echo "✅ Web build exported"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 7 days
+  rules:
+    - exists:
+        - app.json
+      changes:
+        - "**/*.{ts,tsx,js,jsx}"
+
+build-web-container:
+  stage: build
+  image: docker:27
+  script:
+    - |
+      if [ ! -f "Dockerfile.web" ] && [ ! -f "Dockerfile" ]; then
+        cat > /tmp/Dockerfile.web << 'WEBDOCKERFILE'
+      FROM nginx:alpine
+      COPY dist/ /usr/share/nginx/html/
+      EXPOSE 80
+      CMD ["nginx", "-g", "daemon off;"]
+      WEBDOCKERFILE
+        DOCKERFILE="/tmp/Dockerfile.web"
+      else
+        DOCKERFILE="${DOCKERFILE_WEB:-Dockerfile.web}"
+        [ ! -f "$DOCKERFILE" ] && DOCKERFILE="Dockerfile"
+      fi
+    - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
+    - docker build -t $CI_REG/$CI_PROJECT_PATH:web-$CI_COMMIT_SHORT_SHA -f $DOCKERFILE .
+    - docker push $CI_REG/$CI_PROJECT_PATH:web-$CI_COMMIT_SHORT_SHA
+    - echo "✅ Web container pushed"
+  needs:
+    - build-web
+  rules:
+    - if: $CI_REG
+      exists:
+        - app.json
+
+# EAS Update (OTA) — instant patches on main
+
 
 # === Security jobs only on gitlab.com ===
 semgrep-sast:

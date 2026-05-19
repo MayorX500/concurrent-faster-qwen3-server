@@ -16,13 +16,23 @@ use tower_http::cors::{CorsLayer, Any};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qwen3_tts::{Language, SynthesisOptions};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::Cursor, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    collections::HashMap,
+    io::Cursor,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::info;
 
 fn rand_u64() -> u64 {
     let mut buf = [0u8; 8];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| { use std::io::Read; f.read_exact(&mut buf) }).unwrap_or_default();
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        })
+        .unwrap_or_default();
     u64::from_ne_bytes(buf)
 }
 
@@ -98,7 +108,9 @@ struct PreloadResponse {
     cached: bool,
 }
 
-fn default_language() -> String { "spanish".into() }
+fn default_language() -> String {
+    "spanish".into()
+}
 
 /// Split long text into sentences for voice clone (model truncates >25 words).
 /// Only splits when voice_id is present and text exceeds threshold.
@@ -129,12 +141,16 @@ fn split_sentences(text: &str) -> Vec<String> {
                 part.push(ch);
                 if ch == ',' && part.split_whitespace().count() >= 8 {
                     let t = part.trim().to_string();
-                    if !t.is_empty() { result.push(t); }
+                    if !t.is_empty() {
+                        result.push(t);
+                    }
                     part.clear();
                 }
             }
             let t = part.trim().to_string();
-            if !t.is_empty() { result.push(t); }
+            if !t.is_empty() {
+                result.push(t);
+            }
         } else {
             result.push(s);
         }
@@ -145,19 +161,29 @@ fn split_sentences(text: &str) -> Vec<String> {
 const SPLIT_WORD_THRESHOLD: usize = 20;
 
 #[derive(Serialize)]
-struct HealthResponse { status: &'static str, queue_depth: usize, max_batch: usize }
+struct HealthResponse {
+    status: &'static str,
+    queue_depth: usize,
+    max_batch: usize,
+}
 
 #[derive(Serialize)]
-struct ErrorResponse { error: String }
+struct ErrorResponse {
+    error: String,
+}
 
 fn parse_language(s: &str) -> Result<Language, String> {
     match s.to_lowercase().as_str() {
-        "spanish" | "es" => Ok(Language::Spanish),
-        "english" | "en" => Ok(Language::English),
-        "french" | "fr" => Ok(Language::French),
         "chinese" | "zh" => Ok(Language::Chinese),
+        "english" | "en" => Ok(Language::English),
         "japanese" | "ja" => Ok(Language::Japanese),
         "korean" | "ko" => Ok(Language::Korean),
+        "german" | "de" => Ok(Language::German),
+        "french" | "fr" => Ok(Language::French),
+        "russian" | "ru" => Ok(Language::Russian),
+        "portuguese" | "pt" => Ok(Language::Portuguese),
+        "spanish" | "es" => Ok(Language::Spanish),
+        "italian" | "it" => Ok(Language::Italian),
         other => Err(format!("unsupported language: {other}")),
     }
 }
@@ -178,7 +204,10 @@ fn validate_request(req: &SpeechRequest) -> Result<(), (StatusCode, String)> {
     parse_language(&req.language).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     if let Some(t) = req.temperature {
         if !(0.0..=1.0).contains(&t) {
-            return Err((StatusCode::BAD_REQUEST, format!("temperature must be 0.0-1.0, got {t}")));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("temperature must be 0.0-1.0, got {t}"),
+            ));
         }
     }
     if let Some(sr) = req.sample_rate {
@@ -205,10 +234,17 @@ fn resample_if_needed(samples: &[f32], from_rate: u32, to_rate: Option<u32>) -> 
 }
 
 fn audio_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
-    let spec = WavSpec { channels: 1, sample_rate, bits_per_sample: 16, sample_format: SampleFormat::Int };
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
     let mut buf = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut buf, spec)?;
-    for &s in samples { writer.write_sample((s * 32767.0).clamp(-32768.0, 32767.0) as i16)?; }
+    for &s in samples {
+        writer.write_sample((s * 32767.0).clamp(-32768.0, 32767.0) as i16)?;
+    }
     writer.finalize()?;
     Ok(buf.into_inner())
 }
@@ -240,32 +276,63 @@ fn wav_header(sample_rate: u32, data_len: u32) -> Vec<u8> {
     h
 }
 
-
-async fn preload_embedding(State(state): State<Arc<AppState>>, Json(req): Json<PreloadRequest>) -> Response {
+async fn preload_embedding(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PreloadRequest>,
+) -> Response {
     let bytes = match base64::engine::general_purpose::STANDARD.decode(&req.ref_audio) {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("invalid base64: {e}") })).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid base64: {e}"),
+                }),
+            )
+                .into_response()
+        }
     };
     let audio_hash = hash_bytes(&bytes);
-    let voice_id = req.voice_id.unwrap_or_else(|| format!("{:016x}", audio_hash));
+    let voice_id = req
+        .voice_id
+        .unwrap_or_else(|| format!("{:016x}", audio_hash));
 
     // Check if already cached (by audio hash or voice_id name)
     let vid_hash = hash_bytes(voice_id.as_bytes());
     if let Ok(c) = state.prompt_cache.lock() {
         if c.contains_key(&audio_hash) || c.contains_key(&vid_hash) {
-            return Json(PreloadResponse { voice_id, cached: true }).into_response();
+            return Json(PreloadResponse {
+                voice_id,
+                cached: true,
+            })
+            .into_response();
         }
     }
 
     // Write temp file, load, encode
     let tmp = std::env::temp_dir().join(format!("preload_{:016x}.wav", rand_u64()));
-    if let Err(e) = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
-        .and_then(|mut f| { use std::io::Write; f.write_all(&bytes) }) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e}") })).into_response();
+    if let Err(e) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(&bytes)
+        })
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("{e}"),
+            }),
+        )
+            .into_response();
     }
     let result = (|| -> anyhow::Result<Arc<qwen3_tts::VoiceClonePrompt>> {
         let ref_buf = qwen3_tts::AudioBuffer::load(&tmp)?;
-        let prompt = state.model.create_voice_clone_prompt(&ref_buf, req.ref_text.as_deref())?;
+        let prompt = state
+            .model
+            .create_voice_clone_prompt(&ref_buf, req.ref_text.as_deref())?;
         Ok(Arc::new(prompt))
     })();
     let _ = std::fs::remove_file(&tmp);
@@ -276,14 +343,30 @@ async fn preload_embedding(State(state): State<Arc<AppState>>, Json(req): Json<P
                 c.insert(audio_hash, prompt.clone());
                 c.insert(vid_hash, prompt); // also cache by voice_id name
             }
-            Json(PreloadResponse { voice_id, cached: false }).into_response()
+            Json(PreloadResponse {
+                voice_id,
+                cached: false,
+            })
+            .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("{e}") })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("{e}"),
+            }),
+        )
+            .into_response(),
     }
 }
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let queue = state.max_inflight.saturating_sub(state.semaphore.available_permits());
-    Json(HealthResponse { status: "ok", queue_depth: queue, max_batch: state.max_batch })
+    let queue = state
+        .max_inflight
+        .saturating_sub(state.semaphore.available_permits());
+    Json(HealthResponse {
+        status: "ok",
+        queue_depth: queue,
+        max_batch: state.max_batch,
+    })
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> String {
@@ -307,7 +390,10 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
     )
 }
 
-async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRequest>) -> Response {
+async fn synthesize(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SpeechRequest>,
+) -> Response {
     let t0 = std::time::Instant::now();
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     if let Err((status, msg)) = validate_request(&req) {
@@ -316,11 +402,14 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
     }
 
     // Auto sentence-split for voice clone with long text
-    let needs_split = req.voice_id.is_some()
-        && req.text.split_whitespace().count() > SPLIT_WORD_THRESHOLD;
+    let needs_split =
+        req.voice_id.is_some() && req.text.split_whitespace().count() > SPLIT_WORD_THRESHOLD;
 
     if req.stream.unwrap_or(false) {
-        state.metrics.requests_streaming.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .requests_streaming
+            .fetch_add(1, Ordering::Relaxed);
         if needs_split {
             return synthesize_streaming_split(state, req).await;
         }
@@ -329,25 +418,48 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
 
     let permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Queue full".into() })).into_response(); },
+        Err(_) => {
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Queue full".into(),
+                }),
+            )
+                .into_response();
+        }
     };
 
     // Resolve voice: voice_id (cached) > ref_audio (encode)
     let (voice_clone, cached_prompt) = if let Some(vid) = &req.voice_id {
         let hash = hash_bytes(vid.as_bytes());
-        let prompt = state.prompt_cache.lock().ok()
-            .and_then(|c| c.get(&hash).or_else(|| {
-                // Try parsing voice_id as hex hash
-                u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h))
-            }).cloned());
+        let prompt = state.prompt_cache.lock().ok().and_then(|c| {
+            c.get(&hash)
+                .or_else(|| {
+                    // Try parsing voice_id as hex hash
+                    u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h))
+                })
+                .cloned()
+        });
         match prompt {
             Some(p) => (None, Some(p)),
-            None => return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("voice_id '{vid}' not found — preload first") })).into_response(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("voice_id '{vid}' not found — preload first"),
+                    }),
+                )
+                    .into_response()
+            }
         }
     } else {
         let vc = match decode_ref_audio(&req) {
             Ok(vc) => vc,
-            Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
+            Err((status, msg)) => {
+                state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return (status, Json(ErrorResponse { error: msg })).into_response();
+            }
         };
         (vc, None)
     };
@@ -355,15 +467,27 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
     let (reply_tx, reply_rx) = oneshot::channel();
     let target_sample_rate = req.sample_rate;
     let batch_req = BatchRequest {
-        text: req.text, language: parse_language(&req.language).unwrap(), voice_clone, cached_prompt,
-        options: SynthesisOptions { temperature: req.temperature.unwrap_or(0.7), ..SynthesisOptions::default() },
+        text: req.text,
+        language: parse_language(&req.language).unwrap(),
+        voice_clone,
+        cached_prompt,
+        options: SynthesisOptions {
+            temperature: req.temperature.unwrap_or(0.7),
+            ..SynthesisOptions::default()
+        },
         reply: reply_tx,
     };
 
     if state.tx.send(batch_req).await.is_err() {
         drop(permit);
         state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Engine down".into() })).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Engine down".into(),
+            }),
+        )
+            .into_response();
     }
 
     match reply_rx.await {
@@ -371,23 +495,63 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
             drop(permit);
             let duration = result.audio.samples.len() as f32 / result.audio.sample_rate as f32;
             let rtf = duration / result.gen_time_secs;
-            state.metrics.audio_seconds_total.fetch_add((duration * 1000.0) as u64, Ordering::Relaxed);
-            state.metrics.gen_seconds_total.fetch_add((result.gen_time_secs * 1000.0) as u64, Ordering::Relaxed);
+            state
+                .metrics
+                .audio_seconds_total
+                .fetch_add((duration * 1000.0) as u64, Ordering::Relaxed);
+            state
+                .metrics
+                .gen_seconds_total
+                .fetch_add((result.gen_time_secs * 1000.0) as u64, Ordering::Relaxed);
             info!(duration, gen_time = result.gen_time_secs, rtf, "Done");
             let (final_samples, final_rate) = resample_if_needed(&result.audio.samples, result.audio.sample_rate, target_sample_rate);
             match audio_to_wav_bytes(&final_samples, final_rate) {
                 Ok(wav) => {
                     let ttfa_ms = t0.elapsed().as_millis();
-                    (StatusCode::OK, [("content-type", "audio/wav"), ("x-rtf", &format!("{rtf:.2}")), ("x-ttfa-ms", &ttfa_ms.to_string())], wav).into_response()
-                },
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e:#}") })).into_response(),
+                    (
+                        StatusCode::OK,
+                        [
+                            ("content-type", "audio/wav"),
+                            ("x-rtf", &format!("{rtf:.2}")),
+                            ("x-ttfa-ms", &ttfa_ms.to_string()),
+                        ],
+                        wav,
+                    )
+                        .into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("{e:#}"),
+                    }),
+                )
+                    .into_response(),
             }
         }
-        Ok(Err(e)) => { drop(permit); state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e:#}") })).into_response() }
-        Err(_) => { drop(permit); state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Dropped".into() })).into_response() }
+        Ok(Err(e)) => {
+            drop(permit);
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("{e:#}"),
+                }),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            drop(permit);
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Dropped".into(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
-
 
 /// Streaming synthesis with automatic sentence splitting for voice clone.
 /// Generates each sentence separately and streams all chunks sequentially.
@@ -423,9 +587,14 @@ async fn synthesize_streaming_split(state: Arc<AppState>, req: SpeechRequest) ->
             // Resolve voice
             let cached_prompt = if let Some(vid) = &part_req.voice_id {
                 let hash = hash_bytes(vid.as_bytes());
-                state2.prompt_cache.lock().ok()
-                    .and_then(|c| c.get(&hash).or_else(|| u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h))).cloned())
-            } else { None };
+                state2.prompt_cache.lock().ok().and_then(|c| {
+                    c.get(&hash)
+                        .or_else(|| u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h)))
+                        .cloned()
+                })
+            } else {
+                None
+            };
 
             let stream_req = StreamingRequest {
                 text: part_req.text.clone(),
@@ -447,17 +616,24 @@ async fn synthesize_streaming_split(state: Arc<AppState>, req: SpeechRequest) ->
                     Ok(data) => {
                         if first && data.len() == 44 {
                             // First sentence WAV header — forward it
-                            if tx.send(Ok(data)).await.is_err() { return; }
+                            if tx.send(Ok(data)).await.is_err() {
+                                return;
+                            }
                             first = false;
                         } else if !first && data.len() == 44 {
                             // Subsequent sentence WAV header — skip
                             continue;
                         } else {
-                            if tx.send(Ok(data)).await.is_err() { return; }
+                            if tx.send(Ok(data)).await.is_err() {
+                                return;
+                            }
                             first = false;
                         }
                     }
-                    Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
                 }
             }
         }
@@ -466,8 +642,24 @@ async fn synthesize_streaming_split(state: Arc<AppState>, req: SpeechRequest) ->
     // Wait for first chunk (WAV header)
     let first_chunk = match rx.recv().await {
         Some(Ok(data)) => data,
-        Some(Err(e)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })).into_response(); },
-        None => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "No audio".into() })).into_response(); },
+        Some(Err(e)) => {
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+                .into_response();
+        }
+        None => {
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "No audio".into(),
+                }),
+            )
+                .into_response();
+        }
     };
     let ttfa_ms = t0.elapsed().as_millis();
 
@@ -484,7 +676,9 @@ async fn synthesize_streaming_split(state: Arc<AppState>, req: SpeechRequest) ->
         .header("x-ttfa-ms", ttfa_ms.to_string())
         .header("x-sentence-split", "true")
         .body(body)
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response()
+        })
 }
 async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Response {
     let t0 = std::time::Instant::now();
@@ -494,33 +688,76 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
     // Resolve voice: voice_id (cached) > ref_audio (encode)
     let (voice_clone, cached_prompt) = if let Some(vid) = &req.voice_id {
         let hash = hash_bytes(vid.as_bytes());
-        let prompt = state.prompt_cache.lock().ok()
-            .and_then(|c| c.get(&hash).or_else(|| u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h))).cloned());
+        let prompt = state.prompt_cache.lock().ok().and_then(|c| {
+            c.get(&hash)
+                .or_else(|| u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h)))
+                .cloned()
+        });
         match prompt {
             Some(p) => (None, Some(p)),
-            None => return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("voice_id '{vid}' not found") })).into_response(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("voice_id '{vid}' not found"),
+                    }),
+                )
+                    .into_response()
+            }
         }
     } else {
         let vc = match decode_ref_audio(&req) {
             Ok(vc) => vc,
-            Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
+            Err((status, msg)) => {
+                state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                return (status, Json(ErrorResponse { error: msg })).into_response();
+            }
         };
         (vc, None)
     };
 
     let (tx, mut rx) = mpsc::channel::<Result<Vec<u8>, String>>(32);
 
-    let stream_req = StreamingRequest { text, language, temperature: req.temperature.unwrap_or(0.7), voice_clone, cached_prompt, tx };
+    let stream_req = StreamingRequest {
+        text,
+        language,
+        temperature: req.temperature.unwrap_or(0.7),
+        voice_clone,
+        cached_prompt,
+        tx,
+    };
     if let Err(_) = state.stream_tx.try_send(stream_req) {
         state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Stream queue full".into() })).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Stream queue full".into(),
+            }),
+        )
+            .into_response();
     }
 
     // Wait for first chunk to measure TTFA and include in headers
     let first_chunk = match rx.recv().await {
         Some(Ok(data)) => data,
-        Some(Err(e)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })).into_response(); },
-        None => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "No audio generated".into() })).into_response(); },
+        Some(Err(e)) => {
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+                .into_response();
+        }
+        None => {
+            state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "No audio generated".into(),
+                }),
+            )
+                .into_response();
+        }
     };
     let ttfa_ms = t0.elapsed().as_millis();
 
@@ -537,7 +774,9 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
         .header("x-audio-format", "pcm-s16le-24000-mono")
         .header("x-ttfa-ms", ttfa_ms.to_string())
         .body(body)
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response())
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response()
+        })
 }
 
 struct StreamingRequest {
@@ -549,11 +788,26 @@ struct StreamingRequest {
     tx: mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
-fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptCache) -> mpsc::Sender<StreamingRequest> {
-    let stream_max_batch: usize = std::env::var("STREAM_MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    let stream_wait_ms: u64 = std::env::var("STREAM_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
-    let stream_poll_ms: u64 = std::env::var("STREAM_POLL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-    let stream_chunk_frames: usize = std::env::var("STREAM_CHUNK_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+fn start_streaming_worker(
+    model: Arc<qwen3_tts::Qwen3TTS>,
+    cache: batch::PromptCache,
+) -> mpsc::Sender<StreamingRequest> {
+    let stream_max_batch: usize = std::env::var("STREAM_MAX_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let stream_wait_ms: u64 = std::env::var("STREAM_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let stream_poll_ms: u64 = std::env::var("STREAM_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let stream_chunk_frames: usize = std::env::var("STREAM_CHUNK_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
 
     let (tx, rx) = mpsc::channel::<StreamingRequest>(16);
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
@@ -564,7 +818,10 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
         loop {
             // Block on first request
             let first = {
-                let mut guard = rx.lock().unwrap_or_else(|e| { tracing::error!("streaming mutex poisoned, recovering"); e.into_inner() });
+                let mut guard = rx.lock().unwrap_or_else(|e| {
+                    tracing::error!("streaming mutex poisoned, recovering");
+                    e.into_inner()
+                });
                 match guard.blocking_recv() {
                     Some(r) => r,
                     None => break,
@@ -573,15 +830,25 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
 
             // Collect more requests within window for batching
             let mut batch = vec![first];
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(stream_wait_ms);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(stream_wait_ms);
             loop {
-                if batch.len() >= stream_max_batch { break; }
-                let mut guard = rx.lock().unwrap_or_else(|e| { tracing::error!("streaming mutex poisoned, recovering"); e.into_inner() });
+                if batch.len() >= stream_max_batch {
+                    break;
+                }
+                let mut guard = rx.lock().unwrap_or_else(|e| {
+                    tracing::error!("streaming mutex poisoned, recovering");
+                    e.into_inner()
+                });
                 match guard.try_recv() {
-                    Ok(r) => { batch.push(r); }
+                    Ok(r) => {
+                        batch.push(r);
+                    }
                     Err(_) => {
                         drop(guard);
-                        if std::time::Instant::now() >= deadline { break; }
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(stream_poll_ms));
                     }
                 }
@@ -591,7 +858,8 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
             info!(batch_size = n, "Streaming batch");
 
             // Build voice clone prompts: use cached_prompt if available, else encode
-            let mut prompts: Vec<Option<std::sync::Arc<qwen3_tts::VoiceClonePrompt>>> = Vec::with_capacity(n);
+            let mut prompts: Vec<Option<std::sync::Arc<qwen3_tts::VoiceClonePrompt>>> =
+                Vec::with_capacity(n);
             let mut to_remove: Vec<usize> = Vec::new();
             for (idx, req) in batch.iter().enumerate() {
                 if let Some(p) = &req.cached_prompt {
@@ -603,20 +871,31 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                 }
             }
             // Build prompts for requests that need encoding
-            let needs_encode: Vec<(usize, &VoiceCloneData)> = batch.iter().enumerate()
+            let needs_encode: Vec<(usize, &VoiceCloneData)> = batch
+                .iter()
+                .enumerate()
                 .filter(|(_, r)| r.cached_prompt.is_none() && r.voice_clone.is_some())
                 .map(|(i, r)| (i, r.voice_clone.as_ref().unwrap()))
                 .collect();
             if !needs_encode.is_empty() {
-                let vc_refs: Vec<Option<&VoiceCloneData>> = batch.iter()
-                    .map(|r| if r.cached_prompt.is_none() { r.voice_clone.as_ref() } else { None })
+                let vc_refs: Vec<Option<&VoiceCloneData>> = batch
+                    .iter()
+                    .map(|r| {
+                        if r.cached_prompt.is_none() {
+                            r.voice_clone.as_ref()
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 let (encoded, failed) = build_voice_clone_prompts(&model, &vc_refs, &cache);
                 for &idx in failed.iter().rev() {
                     to_remove.push(idx);
                 }
                 for (idx, p) in encoded.into_iter().enumerate() {
-                    if prompts[idx].is_none() { prompts[idx] = p; }
+                    if prompts[idx].is_none() {
+                        prompts[idx] = p;
+                    }
                 }
             }
 
@@ -626,35 +905,50 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                 let req = batch.remove(idx);
                 let _ = req.tx.blocking_send(Err("Voice clone failed".into()));
             }
-            if batch.is_empty() { continue; }
+            if batch.is_empty() {
+                continue;
+            }
 
             // Streaming with voice_prompts uses speaker embedding (x_vector style)
             // — no ref_text replay frames to skip. skip_samples = 0 for all.
             let skip_samples: Vec<usize> = vec![0; batch.len()];
 
             let n = batch.len();
-            let requests: Vec<(String, qwen3_tts::Language, Option<qwen3_tts::SynthesisOptions>)> = batch.iter()
-                .map(|r| (r.text.clone(), r.language,
-                    Some(qwen3_tts::SynthesisOptions {
-                        temperature: r.temperature,
-                        max_length: batch::adaptive_max_length_streaming(&r.text),
-                        ..Default::default()
-                    })
-                )).collect();
+            let requests: Vec<(
+                String,
+                qwen3_tts::Language,
+                Option<qwen3_tts::SynthesisOptions>,
+            )> = batch
+                .iter()
+                .map(|r| {
+                    (
+                        r.text.clone(),
+                        r.language,
+                        Some(qwen3_tts::SynthesisOptions {
+                            temperature: r.temperature,
+                            max_length: batch::adaptive_max_length_streaming(&r.text),
+                            ..Default::default()
+                        }),
+                    )
+                })
+                .collect();
             let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
                 prompts.iter().map(|p| p.as_deref()).collect();
 
             let (senders, receivers): (Vec<_>, Vec<_>) = (0..n)
-                .map(|_| std::sync::mpsc::channel::<qwen3_tts::AudioBuffer>()).unzip();
+                .map(|_| std::sync::mpsc::channel::<qwen3_tts::AudioBuffer>())
+                .unzip();
 
             // Stop flags: forward threads signal generation loop to stop early
             let stop_flags: Vec<Arc<std::sync::atomic::AtomicBool>> = (0..n)
-                .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false))).collect();
+                .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .collect();
 
             // Forward decoded audio chunks: std::sync → tokio channels as PCM
             // ICL requests skip ref_audio duration to remove ref_text replay
             // WAV header sent with first real chunk (#37)
-            let forwards: Vec<std::thread::JoinHandle<()>> = receivers.into_iter()
+            let forwards: Vec<std::thread::JoinHandle<()>> = receivers
+                .into_iter()
                 .zip(batch.iter().map(|r| r.tx.clone()))
                 .zip(skip_samples.iter())
                 .zip(stop_flags.iter().cloned())
@@ -674,36 +968,65 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                                 let trimmed = &samples[remaining_skip..];
                                 remaining_skip = 0;
                                 if !header_sent {
-                                    if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { break; }
+                                    if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err()
+                                    {
+                                        break;
+                                    }
                                     header_sent = true;
                                 }
-                                if tx.blocking_send(Ok(samples_to_pcm16(trimmed))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
+                                if tx.blocking_send(Ok(samples_to_pcm16(trimmed))).is_err() {
+                                    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
                                 continue;
                             }
                             // Stop sending on silence (model past EOS)
-                            let rms: f32 = (samples.iter().map(|s| s*s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+                            let rms: f32 = (samples.iter().map(|s| s * s).sum::<f32>()
+                                / samples.len().max(1) as f32)
+                                .sqrt();
                             // Stop on silence only after speech has started
-                            if speech_chunks > 2 && rms < 0.003 { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
-                            if rms > 0.01 { speech_chunks += 1; }
+                            if speech_chunks > 2 && rms < 0.003 {
+                                stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                            if rms > 0.01 {
+                                speech_chunks += 1;
+                            }
                             if !header_sent {
-                                if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
+                                if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() {
+                                    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    break;
+                                }
                                 header_sent = true;
                             }
-                            if tx.blocking_send(Ok(samples_to_pcm16(samples))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
+                            if tx.blocking_send(Ok(samples_to_pcm16(samples))).is_err() {
+                                stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
                         }
                     })
-                }).collect();
+                })
+                .collect();
 
             // Run batched streaming (decodes + sends every 10 frames ~800ms)
-            let stop_refs: Vec<&std::sync::atomic::AtomicBool> = stop_flags.iter().map(|f| f.as_ref()).collect();
-            if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, stream_chunk_frames, &prompt_refs, &stop_refs) {
+            let stop_refs: Vec<&std::sync::atomic::AtomicBool> =
+                stop_flags.iter().map(|f| f.as_ref()).collect();
+            if let Err(e) = model.synthesize_batch_streaming(
+                &requests,
+                &senders,
+                stream_chunk_frames,
+                &prompt_refs,
+                &stop_refs,
+            ) {
                 for req in &batch {
                     let _ = req.tx.blocking_send(Err(format!("{e}")));
                 }
             }
 
             drop(senders);
-            for f in forwards { let _ = f.join(); }
+            for f in forwards {
+                let _ = f.join();
+            }
         }
     });
 
@@ -712,7 +1035,10 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
 
 /// Max ref_audio decoded size in bytes (default 10 MB)
 fn max_ref_audio_bytes() -> usize {
-    std::env::var("MAX_REF_AUDIO_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(10 * 1024 * 1024)
+    std::env::var("MAX_REF_AUDIO_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10 * 1024 * 1024)
 }
 
 fn decode_ref_audio(req: &SpeechRequest) -> Result<Option<VoiceCloneData>, (StatusCode, String)> {
@@ -724,24 +1050,60 @@ fn decode_ref_audio(req: &SpeechRequest) -> Result<Option<VoiceCloneData>, (Stat
     let estimated = b64.len() / 4 * 3;
     let limit = max_ref_audio_bytes();
     if estimated > limit {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("ref_audio exceeds {limit} byte limit")));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("ref_audio exceeds {limit} byte limit"),
+        ));
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid ref_audio base64: {e}")))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid ref_audio base64: {e}"),
+            )
+        })?;
     if bytes.len() > limit {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("ref_audio exceeds {limit} byte limit")));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("ref_audio exceeds {limit} byte limit"),
+        ));
     }
-    let tmp = std::env::temp_dir().join(format!("ref_{:016x}{:016x}.wav",
-        rand_u64(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64));
-    std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
-        .and_then(|mut f| { use std::io::Write; f.write_all(&bytes) })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ref_audio: {e}")))?;
+    let tmp = std::env::temp_dir().join(format!(
+        "ref_{:016x}{:016x}.wav",
+        rand_u64(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(&bytes)
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to write ref_audio: {e}"),
+            )
+        })?;
     // Validate WAV is loadable before accepting (#34)
     if qwen3_tts::AudioBuffer::load(&tmp).is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err((StatusCode::BAD_REQUEST, "ref_audio is not a valid WAV file".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ref_audio is not a valid WAV file".into(),
+        ));
     }
-    Ok(Some(VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone(), audio_hash: hash_bytes(&bytes) }))
+    Ok(Some(VoiceCloneData {
+        ref_audio_path: tmp,
+        ref_text: req.ref_text.clone(),
+        audio_hash: hash_bytes(&bytes),
+    }))
 }
 
 use tokio_stream::StreamExt;
@@ -770,13 +1132,24 @@ async fn auth_middleware(
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
 
     let model_dir = std::env::var("MODEL_DIR").unwrap_or_else(|_| "models/0.6b-base".into());
-    let max_batch: usize = std::env::var("MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    let max_wait_ms: u64 = std::env::var("MAX_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
-    let port: u16 = std::env::var("PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8090);
+    let max_batch: usize = std::env::var("MAX_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let max_wait_ms: u64 = std::env::var("MAX_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8090);
 
     info!(model_dir = %model_dir, max_batch, max_wait_ms, port, "Starting qwen3-tts-server");
 
@@ -793,20 +1166,36 @@ async fn main() -> Result<()> {
         if let Ok(prompt) = model.create_voice_clone_prompt(&dummy_audio, Some("warmup")) {
             // Run a short synthesis to warm transformer + vocoder
             let _ = model.synthesize_voice_clone(
-                "warmup", &prompt, qwen3_tts::Language::English,
-                Some(qwen3_tts::SynthesisOptions { max_length: 5, ..Default::default() }),
+                "warmup",
+                &prompt,
+                qwen3_tts::Language::English,
+                Some(qwen3_tts::SynthesisOptions {
+                    max_length: 5,
+                    ..Default::default()
+                }),
             );
         }
         info!(elapsed_ms = t0.elapsed().as_millis(), "Warmup complete");
     }
 
     let prompt_cache: batch::PromptCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let tx = BatchEngine::start(model.clone(), BatchEngineConfig { max_batch_size: max_batch, max_wait_ms }, prompt_cache.clone());
+    let tx = BatchEngine::start(
+        model.clone(),
+        BatchEngineConfig {
+            max_batch_size: max_batch,
+            max_wait_ms,
+        },
+        prompt_cache.clone(),
+    );
     let stream_tx = start_streaming_worker(model.clone(), prompt_cache.clone());
     let max_inflight = max_batch * 2;
 
     let state = Arc::new(AppState {
-        tx, stream_tx, semaphore: Arc::new(Semaphore::new(max_inflight)), max_inflight, max_batch,
+        tx,
+        stream_tx,
+        semaphore: Arc::new(Semaphore::new(max_inflight)),
+        max_inflight,
+        max_batch,
         metrics: Arc::new(Metrics::new()),
         prompt_cache,
         model: model.clone(),
@@ -843,11 +1232,29 @@ mod tests {
 
     #[test]
     fn test_parse_language() {
-        assert!(matches!(parse_language("spanish"), Ok(Language::Spanish)));
-        assert!(matches!(parse_language("es"), Ok(Language::Spanish)));
+        assert!(matches!(parse_language("chinese"), Ok(Language::Chinese)));
+        assert!(matches!(parse_language("zh"), Ok(Language::Chinese)));
         assert!(matches!(parse_language("english"), Ok(Language::English)));
         assert!(matches!(parse_language("en"), Ok(Language::English)));
+        assert!(matches!(parse_language("japanese"), Ok(Language::Japanese)));
+        assert!(matches!(parse_language("ja"), Ok(Language::Japanese)));
+        assert!(matches!(parse_language("korean"), Ok(Language::Korean)));
+        assert!(matches!(parse_language("ko"), Ok(Language::Korean)));
+        assert!(matches!(parse_language("german"), Ok(Language::German)));
+        assert!(matches!(parse_language("de"), Ok(Language::German)));
         assert!(matches!(parse_language("french"), Ok(Language::French)));
+        assert!(matches!(parse_language("fr"), Ok(Language::French)));
+        assert!(matches!(parse_language("russian"), Ok(Language::Russian)));
+        assert!(matches!(parse_language("ru"), Ok(Language::Russian)));
+        assert!(matches!(
+            parse_language("portuguese"),
+            Ok(Language::Portuguese)
+        ));
+        assert!(matches!(parse_language("pt"), Ok(Language::Portuguese)));
+        assert!(matches!(parse_language("spanish"), Ok(Language::Spanish)));
+        assert!(matches!(parse_language("es"), Ok(Language::Spanish)));
+        assert!(matches!(parse_language("italian"), Ok(Language::Italian)));
+        assert!(matches!(parse_language("it"), Ok(Language::Italian)));
         assert!(parse_language("unknown").is_err());
     }
 
@@ -866,7 +1273,7 @@ mod tests {
         let samples = vec![0.0f32, 1.0, -1.0, 0.5];
         let pcm = samples_to_pcm16(&samples);
         assert_eq!(pcm.len(), 8); // 4 samples * 2 bytes
-        // 0.0 -> 0
+                                  // 0.0 -> 0
         assert_eq!(i16::from_le_bytes([pcm[0], pcm[1]]), 0);
         // 1.0 -> 32767
         assert_eq!(i16::from_le_bytes([pcm[2], pcm[3]]), 32767);
@@ -966,8 +1373,15 @@ mod tests {
     #[test]
     fn test_metrics_struct() {
         let m = Metrics::new();
-        assert_eq!(m.requests_total.load(std::sync::atomic::Ordering::Relaxed), 0);
-        m.requests_total.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(m.requests_total.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert_eq!(
+            m.requests_total.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        m.requests_total
+            .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            m.requests_total.load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
     }
 }

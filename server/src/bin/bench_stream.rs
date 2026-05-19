@@ -1,4 +1,4 @@
-use qwen3_tts::{Qwen3TTS, Language, AudioBuffer};
+use qwen3_tts::{AudioBuffer, Language, Qwen3TTS};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -11,7 +11,16 @@ fn main() {
 
     for n in [2, 4, 8] {
         let requests: Vec<(String, Language, Option<qwen3_tts::SynthesisOptions>)> = (0..n)
-            .map(|i| (format!("Buenos días, le habla el asistente número {}. ¿En qué puedo ayudarle?", i+1), Language::Spanish, None))
+            .map(|i| {
+                (
+                    format!(
+                        "Buenos días, le habla el asistente número {}. ¿En qué puedo ayudarle?",
+                        i + 1
+                    ),
+                    Language::Spanish,
+                    None,
+                )
+            })
             .collect();
 
         let mut senders = Vec::new();
@@ -47,9 +56,17 @@ fn main() {
 
         // Run batched streaming
         let chunk_frames = 5; // ~400ms audio per chunk
-        let no_stop: Vec<std::sync::atomic::AtomicBool> = (0..requests.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        let no_stop: Vec<std::sync::atomic::AtomicBool> = (0..requests.len())
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect();
         let stop_refs: Vec<&std::sync::atomic::AtomicBool> = no_stop.iter().collect();
-        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames, &vec![None; requests.len()], &stop_refs) {
+        if let Err(e) = model.synthesize_batch_streaming(
+            &requests,
+            &senders,
+            chunk_frames,
+            &vec![None; requests.len()],
+            &stop_refs,
+        ) {
             println!("Batch stream {n}: FAILED: {e:#}");
             continue;
         }

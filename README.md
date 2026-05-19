@@ -129,7 +129,7 @@ Synthesize speech from text. Supports standard synthesis, voice cloning, and str
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `text` | string | yes | — | Text to synthesize |
-| `language` | string | no | `"spanish"` | Language: `spanish`/`es`, `english`/`en`, `french`/`fr`, `chinese`/`zh`, `japanese`/`ja`, `korean`/`ko` |
+| `language` | string | no | `"english"` | Language: `chinese`/`zh`, `english`/`en`, `japanese`/`ja`, `korean`/`ko`, `german`/`de`, `french`/`fr`, `russian`/`ru`, `portuguese`/`pt`, `spanish`/`es`, `italian`/`it` |
 | `temperature` | float | no | `0.7` | Sampling temperature (0.0-1.0) |
 | `stream` | bool | no | `false` | Enable chunked streaming response |
 | `ref_audio` | string | no | — | Base64-encoded WAV for voice cloning |

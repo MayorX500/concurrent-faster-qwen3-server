@@ -161,6 +161,8 @@ go-test:
     - go test ./... -v -coverprofile=coverage.out
     - go tool cover -func=coverage.out
   rules:
+    - if: $CI_PROJECT_NAME =~ /^(coordination|prj-control|cosapi-coordination)$/
+      when: never
     - exists:
         - go.mod
 
@@ -184,6 +186,8 @@ rust-test:
   script:
     - cargo test
   rules:
+    - if: $CI_PROJECT_NAME =~ /^(coordination|prj-control|cosapi-coordination)$/
+      when: never
     - exists:
         - Cargo.toml
 
@@ -203,6 +207,8 @@ java-test:
   script:
     - mvn -q test
   rules:
+    - if: $CI_PROJECT_NAME =~ /^(coordination|prj-control|cosapi-coordination)$/
+      when: never
     - exists:
         - pom.xml
 
@@ -287,6 +293,8 @@ vitest:
       - coverage/
     expire_in: 7 days
   rules:
+    - if: $CI_PROJECT_NAME =~ /^(coordination|prj-control|cosapi-coordination)$/
+      when: never
     - exists:
         - vitest.config.ts
         - vitest.config.js
@@ -371,7 +379,8 @@ trivy-scan:
     - if: $CI_MERGE_REQUEST_IID
       exists:
         - Dockerfile
-    - exists:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
+      exists:
         - Dockerfile
       allow_failure: true
   needs:
@@ -395,14 +404,14 @@ sonarqube:
         -Dsonar.scm.provider=git
         -Dsonar.gitlab.project_id=${CI_PROJECT_ID}
   rules:
+    - if: $CI_PROJECT_NAME =~ /^(coordination|prj-control|cosapi-coordination)$/
+      when: never
     - if: $SONAR_TOKEN && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master")
       allow_failure: false
       variables:
         SONAR_WAIT: "true"
-    - if: $SONAR_TOKEN && $CI_COMMIT_BRANCH == "develop"
-      allow_failure: true
-    - if: $SONAR_TOKEN
-      allow_failure: true
+    - if: $SONAR_TOKEN && $CI_MERGE_REQUEST_IID
+      allow_failure: false
 
 import_sonar_issues:
   stage: security

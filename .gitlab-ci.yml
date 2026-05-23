@@ -32,6 +32,109 @@ variables:
   NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.cache/npm"
   GOPATH: "$CI_PROJECT_DIR/.cache/go"
 
+# Push image to Huawei SWR (runs after build-container on main/develop)
+# Push image to Huawei SWR (after trivy scan passes)
+push-huawei:
+  stage: deploy
+  image: docker:27
+  variables:
+    IMAGE_TAG: ${CI_REG}/${CI_PROJECT_PATH}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
+    HUAWEI_TAG: ${HUAWEI_REG}/cce-cosapi/${CI_PROJECT_NAME}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
+    DOCKER_BUILDKIT: "1"
+  script:
+    - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
+    - docker login -u "$HUAWEI_USER" -p "$HUAWEI_PWD" $HUAWEI_REG
+    - docker pull $IMAGE_TAG
+    - docker tag $IMAGE_TAG $HUAWEI_TAG
+    - docker push $HUAWEI_TAG
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag $IMAGE_TAG ${HUAWEI_REG}/cce-cosapi/${CI_PROJECT_NAME}:latest
+        docker push ${HUAWEI_REG}/cce-cosapi/${CI_PROJECT_NAME}:latest
+      elif [ "$CI_COMMIT_BRANCH" = "develop" ]; then
+        docker tag $IMAGE_TAG ${HUAWEI_REG}/cce-cosapi/${CI_PROJECT_NAME}:dev-latest
+        docker push ${HUAWEI_REG}/cce-cosapi/${CI_PROJECT_NAME}:dev-latest
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"
+      exists:
+        - Dockerfile
+  needs:
+    - build-container
+    - trivy-scan
+
+# Deploy to Huawei CCE - QA (develop=automatic)
+deploy-cce-qa:
+  stage: deploy
+  image: dtzar/helm-kubectl:latest
+  script:
+    - mkdir -p ~/.kube && cp $KUBE_CONFIG ~/.kube/config
+    - |
+      RELEASE="${CI_PROJECT_NAME}-dev"
+      if [ -f "deploy/helm/values-dev.yaml" ]; then
+        helm upgrade --install $RELEASE ./deploy/helm           -f ./deploy/helm/values-dev.yaml           -n dev --create-namespace           --set services.${CI_PROJECT_NAME}.image.tag=${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      exists:
+        - deploy/helm/Chart.yaml
+  needs:
+    - push-huawei
+
+# Deploy to Huawei CCE - PROD (main=manual button)
+deploy-cce-prod:
+  stage: deploy
+  image: dtzar/helm-kubectl:latest
+  when: manual
+  script:
+    - mkdir -p ~/.kube && cp $KUBE_CONFIG ~/.kube/config
+    - |
+      RELEASE="${CI_PROJECT_NAME}-prod"
+      if [ -f "deploy/helm/values-prod.yaml" ]; then
+        helm upgrade --install $RELEASE ./deploy/helm           -f ./deploy/helm/values-prod.yaml           -n prod --create-namespace           --set services.${CI_PROJECT_NAME}.image.tag=${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      exists:
+        - deploy/helm/Chart.yaml
+  needs:
+    - push-huawei
+
+# Manual: check K8s status without rebuild (logs, pods, events)
+check-k8s:
+  stage: deploy
+  image: dtzar/helm-kubectl:latest
+  needs: []
+  script:
+    - mkdir -p ~/.kube && cp $KUBE_CONFIG ~/.kube/config
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then NS="prod"; else NS="dev"; fi
+      echo "=== Pods ==="
+      kubectl get pods -n $NS -l app=${CI_PROJECT_NAME} -o wide
+      echo ""
+      echo "=== Events ==="
+      kubectl get events -n $NS --sort-by='.lastTimestamp' | tail -20
+      echo ""
+      echo "=== Logs (last 50 lines) ==="
+      kubectl logs -n $NS -l app=${CI_PROJECT_NAME} --tail=50 --all-containers
+  rules:
+    - if: $CHECK_ONLY == "true"
+      when: always
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"
+      exists:
+        - deploy/helm/Chart.yaml
+
+
+# Ensures MR pipelines are never empty (prevents merge deadlock)
+mr-check:
+  stage: check
+  image: alpine:latest
+  script:
+    - echo "MR pipeline active"
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+
+
 # ============================================================
 # CACHE TEMPLATES — extend in language-specific jobs
 # ============================================================
@@ -265,9 +368,10 @@ build-container:
   image: docker:27
   variables:
     IMAGE_TAG: ${CI_REG}/${CI_PROJECT_PATH}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}
+    DOCKER_BUILDKIT: "1"
   script:
     - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
-    - docker build -t $IMAGE_TAG -f Dockerfile .
+    - docker build --provenance=false --sbom=false -t $IMAGE_TAG -f Dockerfile .
     - docker push $IMAGE_TAG
     - if [ "$CI_COMMIT_BRANCH" = "develop" ]; then docker tag $IMAGE_TAG ${CI_REG}/${CI_PROJECT_PATH}:dev-latest && docker push ${CI_REG}/${CI_PROJECT_PATH}:dev-latest; fi
     - if [ "$CI_COMMIT_BRANCH" = "main" ] || [ "$CI_COMMIT_BRANCH" = "master" ]; then docker tag $IMAGE_TAG ${CI_REG}/${CI_PROJECT_PATH}:latest && docker push ${CI_REG}/${CI_PROJECT_PATH}:latest; fi
@@ -293,15 +397,24 @@ trivy-scan:
   script:
     - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
     - apk add --no-cache jq curl
+    - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+        aquasec/trivy:latest image --severity HIGH,CRITICAL --format json
+        $IMAGE_TAG > /tmp/trivy.json 2>/dev/null || true
+    - VULNS=$(jq '[.Results[]?.Vulnerabilities[]?] | length' /tmp/trivy.json 2>/dev/null || echo 0)
+    - echo "HIGH/CRITICAL vulnerabilities found - $VULNS"
     - |
-      docker run --rm -v /var/run/docker.sock:/var/run/docker.sock         aquasec/trivy:latest image --severity HIGH,CRITICAL --format json         $IMAGE_TAG > /tmp/trivy.json 2>/dev/null || true
-      VULNS=$(jq '[.Results[]?.Vulnerabilities[]?] | length' /tmp/trivy.json 2>/dev/null || echo 0)
-      echo "HIGH/CRITICAL vulnerabilities: $VULNS"
       if [ "$VULNS" -gt "0" ]; then
-        VULN_LIST=$(jq -r '.Results[]?.Vulnerabilities[]? | "- **\(.Severity)** \(.VulnerabilityID) (\(.PkgName)): \(.Title)"' /tmp/trivy.json | head -15)
+        VULN_LIST=$(jq -r '[.Results[]?.Vulnerabilities[]? | "- **\(.Severity)** \(.VulnerabilityID) (\(.PkgName)): \(.Title)"] | unique | .[]' /tmp/trivy.json | head -15)
         TITLE="[Trivy] $VULNS vulnerabilities: ${CI_PROJECT_NAME} (${CI_COMMIT_REF_NAME})"
-        BODY="## Security Scan\n\n**Project:** ${CI_PROJECT_PATH}\n**Ref:** ${CI_COMMIT_REF_NAME}\n**Image:** $IMAGE_TAG\n**Pipeline:** ${CI_PIPELINE_URL}\n\n### Vulnerabilities\n\n${VULN_LIST}\n\n### Fix\nUpdate packages and rebuild."
-        curl -s -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}"           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues"           --data-urlencode "title=$TITLE"           --data-urlencode "description=$BODY"           -d "labels=type::security,priority::high,auto-generated" && echo "Issue created"
+        EXISTING=$(curl -s -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues?state=opened&per_page=5&search=Trivy" | jq "[.[] | select(.title == \"$TITLE\")] | length")
+        if [ "$EXISTING" -gt "0" ]; then
+          echo "Issue already exists, skipping"
+        else
+          DESC=$(printf "## Security Scan\n\n**Project:** %s\n**Ref:** %s\n**Image:** %s\n**Pipeline:** %s\n\n### Vulnerabilities\n\n%s\n\n### Fix\nUpdate packages and rebuild." "$CI_PROJECT_PATH" "$CI_COMMIT_REF_NAME" "$IMAGE_TAG" "$CI_PIPELINE_URL" "$VULN_LIST")
+          jq -n --arg t "$TITLE" --arg d "$DESC" '{"title":$t,"description":$d,"labels":"type::security,priority::high,auto-generated"}' | \
+            curl -s -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" -H "Content-Type: application/json" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues" -d @- > /dev/null
+          echo "Issue created"
+        fi
         exit 1
       fi
   rules:

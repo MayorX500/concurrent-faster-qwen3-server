@@ -136,7 +136,7 @@ eslint:
   image: node:24-alpine
   extends: .node_cache
   script:
-    - npm ci --ignore-scripts
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
     - npx eslint .
   rules:
     - exists:
@@ -153,6 +153,17 @@ go-lint:
     - exists:
         - go.mod
 
+go-test:
+  stage: test
+  image: golang:1.24-alpine
+  extends: .go_cache
+  script:
+    - go test ./... -v -coverprofile=coverage.out
+    - go tool cover -func=coverage.out
+  rules:
+    - exists:
+        - go.mod
+
 rust-lint:
   stage: check
   image: rust:1.84-alpine
@@ -161,6 +172,17 @@ rust-lint:
   script:
     - rustup component add clippy
     - cargo clippy -- -D warnings
+  rules:
+    - exists:
+        - Cargo.toml
+
+rust-test:
+  stage: test
+  image: rust:1.84-alpine
+  before_script:
+    - apk add --no-cache musl-dev
+  script:
+    - cargo test
   rules:
     - exists:
         - Cargo.toml
@@ -174,6 +196,15 @@ java-lint:
     - exists:
         - pom.xml
 
+
+java-test:
+  stage: test
+  image: maven:3.9-eclipse-temurin-21-alpine
+  script:
+    - mvn -q test
+  rules:
+    - exists:
+        - pom.xml
 
 shellcheck:
   stage: check
@@ -208,10 +239,14 @@ pytest:
   extends: .python_cache
   before_script:
     - |
-      if [ -f "pyproject.toml" ]; then
+      if [ -f "uv.lock" ]; then
         pip install -q uv && uv sync
+      elif [ -f "poetry.lock" ]; then
+        pip install -q poetry && poetry install
       elif [ -f "requirements.txt" ]; then
         pip install -q -r requirements.txt
+      elif [ -f "pyproject.toml" ]; then
+        pip install -q uv && uv sync
       fi
     - pip install -q pytest pytest-cov
   script:
@@ -240,7 +275,7 @@ vitest:
   image: node:24-alpine
   extends: .node_cache
   script:
-    - npm ci --ignore-scripts
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
     - npx vitest run --coverage || true
   coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
   artifacts:
@@ -528,7 +563,7 @@ eas-update:
   extends: .node_cache
   before_script:
     - apk add --no-cache bash
-    - npm ci --cache .npm
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
   script:
     - npx eas-cli update --branch production --non-interactive --message "$CI_COMMIT_MESSAGE"
   rules:
@@ -825,7 +860,7 @@ typecheck:
   image: node:24-alpine
   extends: .node_cache
   script:
-    - npm ci --ignore-scripts
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
     - npx tsc --noEmit
   rules:
     - exists:
@@ -837,8 +872,8 @@ build-frontend:
   extends: .node_cache
   allow_failure: true
   script:
-    - npm ci --ignore-scripts
-    - npm run build
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
+    - if [ -f "bun.lockb" ]; then bun run build; elif [ -f "pnpm-lock.yaml" ]; then pnpm run build; elif [ -f "yarn.lock" ]; then yarn build; else npm run build; fi
     - |
       if [ -d ".next" ]; then du -sh .next/;
       elif [ -d "dist" ]; then du -sh dist/;
@@ -890,7 +925,7 @@ expo-doctor:
   image: node:24-alpine
   extends: .node_cache
   script:
-    - npm ci --cache .npm
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
     - npx expo-doctor
   rules:
     - exists:
@@ -904,7 +939,7 @@ build-apk-eas:
   extends: .node_cache
   before_script:
     - apk add --no-cache bash curl jq git
-    - npm ci --cache .npm
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
   script:
     - |
       echo "Configuring EAS project..."
@@ -954,7 +989,7 @@ build-apk-docker:
   variables:
     GRADLE_USER_HOME: "${CI_PROJECT_DIR}/.gradle"
   before_script:
-    - npm ci --legacy-peer-deps
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
     - npx expo prebuild --platform android --no-install 2>/dev/null || true
   script:
     - cd android && ./gradlew assembleRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseG1GC"
@@ -978,7 +1013,7 @@ build-web:
   image: node:24-alpine
   extends: .node_cache
   script:
-    - npm ci --cache .npm
+    - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
     - npx expo export --platform web
     - echo "✅ Web build exported"
   artifacts:

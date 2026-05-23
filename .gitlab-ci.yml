@@ -17,6 +17,14 @@ stages:
   - triage
   - notify
 
+workflow:
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[skip ci\]/
+      when: never
+    - when: always
+
+
+
 # Set git identity from triggering user (for commits/tags in CI)
 before_script:
   - |

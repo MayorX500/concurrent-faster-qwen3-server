@@ -181,10 +181,11 @@ preload_voice("maria.wav", "agent-maria")
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `text` | string | required | Text to synthesize |
-| `language` | string | `"spanish"` | `spanish`/`es`, `english`/`en`, `french`/`fr` |
+| `language` | string | `"spanish"` | `spanish`/`es`, `english`/`en`, `french`/`fr`, `chinese`/`zh`, `japanese`/`ja`, `korean`/`ko` |
 | `temperature` | float | `0.7` | Sampling randomness (0.0-1.0). Lower = more consistent |
 | `stream` | bool | `false` | Enable chunked streaming |
 | `voice_id` | string | — | Preloaded voice ID |
+| `sample_rate` | int | `24000` | Output sample rate: 8000, 16000, 22050, 24000, 44100, 48000 |
 | `ref_audio` | string | — | Base64 WAV for inline voice cloning (prefer preload) |
 | `ref_text` | string | — | Transcript of ref_audio (enables ICL mode, better quality) |
 

@@ -129,12 +129,13 @@ Synthesize speech from text. Supports standard synthesis, voice cloning, and str
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `text` | string | yes | — | Text to synthesize |
-| `language` | string | no | `"spanish"` | Language: `spanish`/`es`, `english`/`en`, `french`/`fr` |
+| `language` | string | no | `"spanish"` | Language: `spanish`/`es`, `english`/`en`, `french`/`fr`, `chinese`/`zh`, `japanese`/`ja`, `korean`/`ko` |
 | `temperature` | float | no | `0.7` | Sampling temperature (0.0-1.0) |
 | `stream` | bool | no | `false` | Enable chunked streaming response |
 | `ref_audio` | string | no | — | Base64-encoded WAV for voice cloning |
 | `ref_text` | string | no | — | Transcript of ref_audio (enables ICL mode for better quality) |
 | `voice_id` | string | no | — | Preloaded voice ID (use `/v1/embeddings/preload` first) |
+| `sample_rate` | int | no | `24000` | Output sample rate: 8000, 16000, 22050, 24000, 44100, 48000 |
 
 #### Response
 

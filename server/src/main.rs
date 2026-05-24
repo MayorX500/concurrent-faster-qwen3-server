@@ -77,6 +77,8 @@ struct SpeechRequest {
     stream: Option<bool>,
     #[serde(default)]
     voice_id: Option<String>,
+    #[serde(default)]
+    sample_rate: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +153,9 @@ fn parse_language(s: &str) -> Result<Language, String> {
         "spanish" | "es" => Ok(Language::Spanish),
         "english" | "en" => Ok(Language::English),
         "french" | "fr" => Ok(Language::French),
+        "chinese" | "zh" => Ok(Language::Chinese),
+        "japanese" | "ja" => Ok(Language::Japanese),
+        "korean" | "ko" => Ok(Language::Korean),
         other => Err(format!("unsupported language: {other}")),
     }
 }
@@ -165,7 +170,27 @@ fn validate_request(req: &SpeechRequest) -> Result<(), (StatusCode, String)> {
             return Err((StatusCode::BAD_REQUEST, format!("temperature must be 0.0-1.0, got {t}")));
         }
     }
+    if let Some(sr) = req.sample_rate {
+        if !VALID_SAMPLE_RATES.contains(&sr) {
+            return Err((StatusCode::BAD_REQUEST, format!("sample_rate must be one of {:?}, got {sr}", VALID_SAMPLE_RATES)));
+        }
+    }
     Ok(())
+}
+
+const VALID_SAMPLE_RATES: &[u32] = &[8000, 16000, 22050, 24000, 44100, 48000];
+
+fn resample_if_needed(samples: &[f32], from_rate: u32, to_rate: Option<u32>) -> (Vec<f32>, u32) {
+    match to_rate {
+        Some(rate) if rate != from_rate && VALID_SAMPLE_RATES.contains(&rate) => {
+            let buf = qwen3_tts::AudioBuffer::new(samples.to_vec(), from_rate);
+            match qwen3_tts::audio::resample::resample(&buf, rate) {
+                Ok(resampled) => (resampled.samples, rate),
+                Err(_) => (samples.to_vec(), from_rate),
+            }
+        }
+        _ => (samples.to_vec(), from_rate),
+    }
 }
 
 fn audio_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
@@ -317,6 +342,7 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
+    let target_sample_rate = req.sample_rate;
     let batch_req = BatchRequest {
         text: req.text, language: parse_language(&req.language).unwrap(), voice_clone, cached_prompt,
         options: SynthesisOptions { temperature: req.temperature.unwrap_or(0.7), ..SynthesisOptions::default() },
@@ -337,7 +363,8 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
             state.metrics.audio_seconds_total.fetch_add((duration * 1000.0) as u64, Ordering::Relaxed);
             state.metrics.gen_seconds_total.fetch_add((result.gen_time_secs * 1000.0) as u64, Ordering::Relaxed);
             info!(duration, gen_time = result.gen_time_secs, rtf, "Done");
-            match audio_to_wav_bytes(&result.audio.samples, result.audio.sample_rate) {
+            let (final_samples, final_rate) = resample_if_needed(&result.audio.samples, result.audio.sample_rate, target_sample_rate);
+            match audio_to_wav_bytes(&final_samples, final_rate) {
                 Ok(wav) => {
                     let ttfa_ms = t0.elapsed().as_millis();
                     (StatusCode::OK, [("content-type", "audio/wav"), ("x-rtf", &format!("{rtf:.2}")), ("x-ttfa-ms", &ttfa_ms.to_string())], wav).into_response()
@@ -379,6 +406,7 @@ async fn synthesize_streaming_split(state: Arc<AppState>, req: SpeechRequest) ->
                 temperature,
                 stream: Some(true),
                 voice_id: voice_id.clone(),
+                sample_rate: None,
             };
 
             // Resolve voice
@@ -823,6 +851,7 @@ mod tests {
             temperature: None,
             stream: None,
             voice_id: None,
+            sample_rate: None,
         };
         let result = decode_ref_audio(&req);
         assert!(result.is_ok());
@@ -845,6 +874,7 @@ mod tests {
             temperature: None,
             stream: None,
             voice_id: None,
+            sample_rate: None,
         };
         assert!(decode_ref_audio(&req).is_err());
     }
@@ -859,6 +889,7 @@ mod tests {
             temperature: None,
             stream: None,
             voice_id: None,
+            sample_rate: None,
         };
         assert!(decode_ref_audio(&req).unwrap().is_none());
     }

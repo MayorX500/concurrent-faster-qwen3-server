@@ -231,7 +231,7 @@ tts_queue_depth 3
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `STREAM_MAX_BATCH` | `8` | Max concurrent streaming requests per batch |
 | `STREAM_WAIT_MS` | `50` | Wait window to collect streaming batch (ms) |
-| `STREAM_CHUNK_FRAMES` | `3` | Frames per streaming chunk (~250ms audio) |
+| `STREAM_CHUNK_FRAMES` | `6` | Frames per streaming chunk (~500ms audio) |
 | `MAX_REF_AUDIO_BYTES` | `10485760` | Max ref_audio size (10MB) |
 
 ## Voice Cloning

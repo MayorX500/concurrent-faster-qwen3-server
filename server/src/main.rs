@@ -4,13 +4,15 @@ use anyhow::Result;
 use axum::{
     body::Body,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, HeaderMap},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::Engine;
 use batch::{BatchEngine, BatchEngineConfig, BatchRequest, VoiceCloneData, build_voice_clone_prompts};
+use tower_http::cors::{CorsLayer, Any};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qwen3_tts::{Language, SynthesisOptions};
 use serde::{Deserialize, Serialize};
@@ -744,6 +746,27 @@ fn decode_ref_audio(req: &SpeechRequest) -> Result<Option<VoiceCloneData>, (Stat
 
 use tokio_stream::StreamExt;
 
+
+/// Optional Bearer token auth middleware. Skips /health.
+async fn auth_middleware(
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    // Skip auth for health check
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+    let token = match std::env::var("API_KEY").ok() {
+        Some(t) if !t.is_empty() => t,
+        _ => return next.run(request).await, // no auth configured
+    };
+    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        Some(v) if v.strip_prefix("Bearer ").unwrap_or("") == token => next.run(request).await,
+        _ => (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid or missing Bearer token".into() })).into_response(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -789,16 +812,28 @@ async fn main() -> Result<()> {
         model: model.clone(),
     });
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/audio/speech", post(synthesize))
         .route("/v1/embeddings/preload", post(preload_embedding))
+        .layer(middleware::from_fn(auth_middleware))
+        .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    info!("Listening on 0.0.0.0:{port}");
-    axum::serve(listener, app).await?;
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".into());
+    let listener = tokio::net::TcpListener::bind(format!("{bind_addr}:{port}")).await?;
+    info!("Listening on {bind_addr}:{port}");
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        info!("Shutdown signal received, draining...");
+    };
+    axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
     Ok(())
 }
 

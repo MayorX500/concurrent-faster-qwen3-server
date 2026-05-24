@@ -21,7 +21,7 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 
 Set `MODEL_DIR` to switch models. No recompilation needed.
 
-> **Full API usage guide with examples**: [docs/USAGE.md](docs/USAGE.md) — batch generation, streaming, voice cloning, Python integration, sentence splitting for long texts.
+> **Full API usage guide with examples**: [docs/API.md](docs/API.md) — batch generation, streaming, voice cloning, Python integration, sentence splitting for long texts.
 
 ## Performance (NVIDIA L4, 23GB)
 

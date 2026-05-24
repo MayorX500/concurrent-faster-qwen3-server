@@ -160,9 +160,18 @@ fn parse_language(s: &str) -> Result<Language, String> {
     }
 }
 
+/// Max text length in characters (configurable via MAX_TEXT_CHARS env var)
+fn max_text_chars() -> usize {
+    std::env::var("MAX_TEXT_CHARS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000)
+}
+
 fn validate_request(req: &SpeechRequest) -> Result<(), (StatusCode, String)> {
     if req.text.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "text must not be empty".into()));
+    }
+    let limit = max_text_chars();
+    if req.text.len() > limit {
+        return Err((StatusCode::BAD_REQUEST, format!("text exceeds {limit} character limit")));
     }
     parse_language(&req.language).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     if let Some(t) = req.temperature {
@@ -281,13 +290,13 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
     let gen_s = m.gen_seconds_total.load(Ordering::Relaxed) as f64 / 1000.0;
     let avg_rtf = if gen_s > 0.0 { audio_s / gen_s } else { 0.0 };
     format!(
-        "# HELP tts_requests_total Total synthesis requests\ntts_requests_total {}\n\
-         # HELP tts_requests_streaming Total streaming requests\ntts_requests_streaming {}\n\
-         # HELP tts_errors_total Total errors\ntts_errors_total {}\n\
-         # HELP tts_audio_seconds_total Total audio generated (seconds)\ntts_audio_seconds_total {:.1}\n\
-         # HELP tts_gen_seconds_total Total generation time (seconds)\ntts_gen_seconds_total {:.1}\n\
-         # HELP tts_avg_rtf Average real-time factor\ntts_avg_rtf {:.2}\n\
-         # HELP tts_queue_depth Current queue depth\ntts_queue_depth {}\n",
+        "# HELP tts_requests_total Total synthesis requests\n# TYPE tts_requests_total counter\ntts_requests_total {}\n\
+         # HELP tts_requests_streaming Total streaming requests\n# TYPE tts_requests_streaming counter\ntts_requests_streaming {}\n\
+         # HELP tts_errors_total Total errors\n# TYPE tts_errors_total counter\ntts_errors_total {}\n\
+         # HELP tts_audio_seconds_total Total audio generated (seconds)\n# TYPE tts_audio_seconds_total counter\ntts_audio_seconds_total {:.1}\n\
+         # HELP tts_gen_seconds_total Total generation time (seconds)\n# TYPE tts_gen_seconds_total counter\ntts_gen_seconds_total {:.1}\n\
+         # HELP tts_avg_rtf Average real-time factor\n# TYPE tts_avg_rtf gauge\ntts_avg_rtf {:.2}\n\
+         # HELP tts_queue_depth Current queue depth\n# TYPE tts_queue_depth gauge\ntts_queue_depth {}\n",
         m.requests_total.load(Ordering::Relaxed),
         m.requests_streaming.load(Ordering::Relaxed),
         m.errors_total.load(Ordering::Relaxed),

@@ -23,6 +23,9 @@ pub fn build_suppression_mask(
     eos_token_id: u32,
     device: &Device,
 ) -> Result<SuppressionMask> {
+    if vocab_size < 1024 {
+        anyhow::bail!("vocab_size ({vocab_size}) must be >= 1024 for suppression mask");
+    }
     let suppress_start = vocab_size - 1024;
     let mut mask_data = vec![0u8; vocab_size];
     for (v, val) in mask_data

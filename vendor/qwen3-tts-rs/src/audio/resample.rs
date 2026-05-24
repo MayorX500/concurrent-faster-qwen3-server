@@ -155,6 +155,11 @@ impl Resampler {
             pos += chunk_size;
         }
 
+        // Trim output to expected length — padding can produce extra samples
+        let ratio = resampler.output_frames_max() as f64 / chunk_size as f64;
+        let expected_len = (samples.len() as f64 * ratio).round() as usize;
+        output.truncate(expected_len.min(output.len()));
+
         Ok(output)
     }
 }

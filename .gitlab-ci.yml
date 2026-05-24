@@ -49,6 +49,37 @@ mr-check:
   rules:
     - if: $CI_MERGE_REQUEST_IID
 
+mr-source-check:
+  image: alpine:latest
+  rules:
+  - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+    when: never
+  - if: $CI_MERGE_REQUEST_IID
+  script:
+  - "if [ \"$CI_MERGE_REQUEST_TARGET_BRANCH_NAME\" = \"main\" ] || [ \"$CI_MERGE_REQUEST_TARGET_BRANCH_NAME\"\
+    \ = \"master\" ]; then\n  if [ \"$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME\" != \"\
+    develop\" ]; then\n    echo \"❌ MR to main must come from develop\"\n    echo\
+    \ \"   Source: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME\"\n    echo \"   Flow: feature/*\
+    \ → develop → main\"\n    exit 1\n  fi\nfi\necho \"✅ MR source branch OK\""
+  stage: check
+
+mr-description-check:
+  image: alpine:latest
+  rules:
+  - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+    when: never
+  - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|master)$/
+  script:
+  - apk add --no-cache curl jq > /dev/null 2>&1
+  - 'MR=$(curl -sf --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID")'
+  - DESC=$(echo "$MR" | jq -r ".description // \"\"")
+  - if [ -z "$DESC" ] || [ ${#DESC} -lt 10 ]; then echo "❌ MR must have a description
+    (min 10 chars)"; exit 1; fi
+  - if ! echo "$DESC" | grep -qiE "(#[0-9]+|closes|fixes|ref|resolves)"; then echo
+    "❌ MR description must reference an issue"; exit 1; fi
+  - echo "✅ MR description OK"
+  stage: check
+
 # Structure validation — enforces project standards
 structure-check:
   stage: check
@@ -212,6 +243,8 @@ eslint:
   extends: .node_cache
   script:
     - if [ -f "bun.lockb" ] || [ -f "bun.lock" ]; then npm i -g bun && bun install; elif [ -f "pnpm-lock.yaml" ]; then npm i -g pnpm && pnpm install; elif [ -f "yarn.lock" ]; then yarn install; else npm ci; fi
+    - 'curl -sf "${CI_API_V4_URL}/projects/610/repository/files/configs%2Ftypescript%2Feslint.config.js/raw?ref=main" -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" -o /tmp/eslint-central.config.js || true'
+    - if [ -f /tmp/eslint-central.config.js ] && [ ! -f eslint.config.js ] && [ ! -f .eslintrc.js ] && [ ! -f .eslintrc.json ]; then cp /tmp/eslint-central.config.js eslint.config.js; fi
     - npx eslint .
   rules:
     - exists:
@@ -1142,6 +1175,85 @@ build-web-container:
 
 # EAS Update (OTA) — instant patches on main
 
+
+auto-tag:
+  image: alpine:latest
+  rules:
+  - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+    when: never
+  - if: $CI_COMMIT_BRANCH =~ /^(main|master)$/
+    when: on_success
+  script:
+  - apk add --no-cache git curl > /dev/null 2>&1
+  - LAST_TAG=$(git tag --sort=-v:refname | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | head
+    -1)
+  - if [ -z "$LAST_TAG" ]; then LAST_TAG="v0.0.0"; fi
+  - MAJOR=$(echo $LAST_TAG | cut -d. -f1 | tr -d v)
+  - MINOR=$(echo $LAST_TAG | cut -d. -f2)
+  - PATCH=$(echo $LAST_TAG | cut -d. -f3)
+  - if git log ${LAST_TAG}..HEAD --format=%s 2>/dev/null | grep -q "^feat"; then MINOR=$((MINOR
+    + 1)); PATCH=0; else PATCH=$((PATCH + 1)); fi
+  - NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+  - 'echo "Tagging: $LAST_TAG → $NEW_TAG"'
+  - 'curl -sf --request POST --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/tags?tag_name=$NEW_TAG&ref=$CI_COMMIT_SHA"
+    > /dev/null'
+  - echo "✅ Tagged $NEW_TAG"
+  stage: deploy
+
+auto-changelog:
+  image: alpine:latest
+  rules:
+  - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+    when: never
+  - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+  script:
+  - apk add --no-cache git curl > /dev/null 2>&1
+  - PREV_TAG=$(git tag --sort=-v:refname | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sed
+    -n "2p")
+  - if [ -z "$PREV_TAG" ]; then PREV_TAG=$(git rev-list --max-parents=0 HEAD); fi
+  - echo "# Changelog" > /tmp/CL.md && echo "" >> /tmp/CL.md
+  - echo "## $CI_COMMIT_TAG ($(date +%Y-%m-%d))" >> /tmp/CL.md && echo "" >> /tmp/CL.md
+  - git log ${PREV_TAG}..HEAD --format="- %s" | grep -E "^- (feat|fix|perf|refactor|docs)"
+    >> /tmp/CL.md || true
+  - echo "" >> /tmp/CL.md
+  - 'curl -sf --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/files/CHANGELOG.md/raw?ref=$CI_COMMIT_BRANCH"
+    >> /tmp/CL.md 2>/dev/null || true'
+  - CONTENT=$(base64 /tmp/CL.md | tr -d "\n")
+  - 'curl -sf --request PUT --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" --header
+    "Content-Type: application/json" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/files/CHANGELOG.md"
+    --data "{\"branch\":\"$CI_COMMIT_BRANCH\",\"commit_message\":\"docs(changelog):
+    update for $CI_COMMIT_TAG [skip ci]\",\"encoding\":\"base64\",\"content\":\"$CONTENT\"}"
+    > /dev/null 2>&1 || curl -sf --request POST --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN"
+    --header "Content-Type: application/json" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/files/CHANGELOG.md"
+    --data "{\"branch\":\"$CI_COMMIT_BRANCH\",\"commit_message\":\"docs(changelog):
+    create for $CI_COMMIT_TAG [skip ci]\",\"encoding\":\"base64\",\"content\":\"$CONTENT\"}"
+    > /dev/null'
+  - echo "✅ CHANGELOG.md updated"
+  stage: deploy
+
+todo-scanner:
+  allow_failure: true
+  image: alpine:latest
+  rules:
+  - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+    when: never
+  - if: $CI_COMMIT_BRANCH == "develop"
+  - if: $CI_COMMIT_BRANCH =~ /^(main|master)$/
+  script:
+  - apk add --no-cache grep curl > /dev/null 2>&1
+  - TODOS=$(grep -rn "TODO\|FIXME\|HACK\|XXX" --include="*.py" --include="*.ts" --include="*.tsx"
+    --include="*.js" --include="*.go" --include="*.rs" . 2>/dev/null | grep -v node_modules
+    | grep -v .venv | grep -v vendor | grep -v "#[0-9]" | head -10)
+  - "if [ -n \"$TODOS\" ]; then\n  echo \"⚠️ TODOs without issue reference:\"\n  echo\
+    \ \"$TODOS\"\n  if [ \"$CI_COMMIT_BRANCH\" = \"develop\" ] && [ -n \"$CI_PERSONAL_TOKEN\"\
+    \ ]; then\n    COUNT=$(curl -sf --header \"PRIVATE-TOKEN: $CI_PERSONAL_TOKEN\"\
+    \ \"$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues?state=opened&search=TODO+items+without+issue\"\
+    \ | grep -c \"iid\" || echo 0)\n    if [ \"$COUNT\" = \"0\" ]; then\n      curl\
+    \ -sf --request POST --header \"PRIVATE-TOKEN: $CI_PERSONAL_TOKEN\" \"$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues\"\
+    \ --data-urlencode \"title=chore: TODO items without issue reference\" --data-urlencode\
+    \ \"labels=type::improvement,priority::low\" > /dev/null\n      echo \"\U0001F4CB\
+    \ Issue created\"\n    fi\n  fi\nelse\n  echo \"✅ No orphan TODOs\"\nfi"
+  stage: check
 
 # === Security jobs only on gitlab.com ===
 semgrep-sast:

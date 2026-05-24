@@ -49,6 +49,80 @@ mr-check:
   rules:
     - if: $CI_MERGE_REQUEST_IID
 
+# Structure validation — enforces project standards
+structure-check:
+  stage: check
+  image: alpine:latest
+  variables:
+    GIT_STRATEGY: fetch
+  script:
+    - |
+      MISSING=""
+      [ ! -f README.md ] && MISSING="$MISSING README.md"
+      [ ! -f .gitlab-ci.yml ] && MISSING="$MISSING .gitlab-ci.yml"
+      [ ! -d docs ] && MISSING="$MISSING docs/"
+      [ ! -d tests ] && MISSING="$MISSING tests/"
+      [ ! -d deploy ] && MISSING="$MISSING deploy/"
+      [ ! -d src ] && [ ! -d app ] && [ ! -d cmd ] && [ ! -d lib ] && MISSING="$MISSING src/"
+      if [ -n "$MISSING" ]; then
+        echo "❌ Missing required structure:$MISSING"
+        echo "Required: README.md, docs/, tests/, deploy/, src/ (or app/cmd/lib)"
+        # Create issue on develop (allow_failure=true so pipeline continues)
+        if [ "$CI_COMMIT_BRANCH" = "develop" ] && [ -n "$CI_PERSONAL_TOKEN" ]; then
+          apk add --no-cache curl > /dev/null 2>&1
+          EXISTING=$(curl -s --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN"             "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues?state=opened&search=Missing+project+structure" | grep -c '"iid"')
+          if [ "$EXISTING" = "0" ]; then
+            curl -s --request POST --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN"               "$CI_API_V4_URL/projects/$CI_PROJECT_ID/issues"               --data-urlencode "title=chore: missing project structure"               --data-urlencode "description=## Missing items\n\n$MISSING\n\n## Required structure\n\nSee: https://scovil.labtau.com/ccvass/infraestructure/prompts/-/blob/main/PROJECT_STRUCTURE.md"               --data-urlencode "labels=type::infra,priority::low" > /dev/null
+            echo "📋 Issue created"
+          fi
+        fi
+        exit 1
+      fi
+      echo "✅ Project structure OK"
+  rules:
+    - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+      when: never
+    - if: $CI_COMMIT_BRANCH == "develop"
+      allow_failure: true
+    - if: $CI_COMMIT_BRANCH =~ /^(main|master)$/
+      allow_failure: false
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|master)$/
+      allow_failure: false
+
+
+# Validates conventional commit format on MR commits
+commit-lint:
+  stage: check
+  image: node:24-alpine
+  script:
+    - npm install -g @commitlint/cli @commitlint/config-conventional
+    - |
+      echo "module.exports = {extends: ['@commitlint/config-conventional']}" > /tmp/commitlint.config.js
+      git log --format=%s origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD | while read msg; do
+        echo "$msg" | commitlint --config /tmp/commitlint.config.js || exit 1
+      done
+      echo "✅ All commits follow conventional format"
+  rules:
+    - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+      when: never
+    - if: $CI_MERGE_REQUEST_IID
+
+# Validates Dockerfile best practices
+dockerfile-lint:
+  stage: check
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - hadolint Dockerfile --failure-threshold warning
+  rules:
+    - if: $CI_PROJECT_NAME =~ /coordination|prj-control|cosapi-coordination/
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|master)$/
+      exists:
+        - Dockerfile
+    - if: $CI_COMMIT_BRANCH =~ /^(main|master|develop)$/
+      exists:
+        - Dockerfile
+      allow_failure: true
 
 # ============================================================
 # CACHE TEMPLATES — extend in language-specific jobs
@@ -129,7 +203,8 @@ ruff:
     - .python_cache
   script:
     - pip install -q ruff
-    - ruff check .
+    - 'curl -sf "${CI_API_V4_URL}/projects/610/repository/files/configs%2Fpython%2Fruff.toml/raw?ref=main" -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" -o /tmp/ruff.toml || true'
+    - if [ -f /tmp/ruff.toml ]; then ruff check --config /tmp/ruff.toml .; else ruff check .; fi
 
 eslint:
   stage: check
@@ -148,7 +223,8 @@ go-lint:
   extends: .go_cache
   script:
     - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-    - golangci-lint run
+    - 'curl -sf "${CI_API_V4_URL}/projects/610/repository/files/configs%2Fgo%2F.golangci.yml/raw?ref=main" -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" -o /tmp/.golangci.yml || true'
+    - if [ -f /tmp/.golangci.yml ]; then golangci-lint run --config /tmp/.golangci.yml; else golangci-lint run; fi
   rules:
     - exists:
         - go.mod
@@ -173,6 +249,7 @@ rust-lint:
     - apk add --no-cache musl-dev
   script:
     - rustup component add clippy
+    - 'curl -sf "${CI_API_V4_URL}/projects/610/repository/files/configs%2Frust%2Fclippy.toml/raw?ref=main" -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" -o clippy.toml || true'
     - cargo clippy -- -D warnings
   rules:
     - exists:

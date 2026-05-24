@@ -92,9 +92,12 @@ structure-check:
       [ ! -f README.md ] && MISSING="$MISSING README.md"
       [ ! -f .gitlab-ci.yml ] && MISSING="$MISSING .gitlab-ci.yml"
       [ ! -d docs ] && MISSING="$MISSING docs/"
-      [ ! -d tests ] && MISSING="$MISSING tests/"
-      [ ! -d deploy ] && MISSING="$MISSING deploy/"
-      [ ! -d src ] && [ ! -d app ] && [ ! -d cmd ] && [ ! -d lib ] && MISSING="$MISSING src/"
+      # Rust projects: tests are inline (#[cfg(test)]), deploy via systemd files
+      if [ ! -f Cargo.toml ]; then
+        [ ! -d tests ] && MISSING="$MISSING tests/"
+        [ ! -d deploy ] && MISSING="$MISSING deploy/"
+      fi
+      [ ! -d src ] && [ ! -d app ] && [ ! -d cmd ] && [ ! -d lib ] && [ ! -d server ] && MISSING="$MISSING src/"
       if [ -n "$MISSING" ]; then
         echo "❌ Missing required structure:$MISSING"
         echo "Required: README.md, docs/, tests/, deploy/, src/ (or app/cmd/lib)"
@@ -692,31 +695,6 @@ eas-update:
         - eas.json
   allow_failure: true
 
-auto-tag:
-  stage: release
-  image: alpine:latest
-  script:
-    - apk add --no-cache git curl
-    - |
-      LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-      MAJOR=$(echo $LAST_TAG | sed 's/v//' | cut -d. -f1)
-      MINOR=$(echo $LAST_TAG | sed 's/v//' | cut -d. -f2)
-      PATCH=$(echo $LAST_TAG | sed 's/v//' | cut -d. -f3)
-      if git log $LAST_TAG..HEAD --oneline | grep -qiE 'BREAKING|!:'; then
-        MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
-      elif git log $LAST_TAG..HEAD --oneline | grep -qiE '^[a-f0-9]+ feat'; then
-        MINOR=$((MINOR + 1)); PATCH=0
-      else
-        PATCH=$((PATCH + 1))
-      fi
-      NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
-      echo "Tagging: $LAST_TAG → $NEW_TAG"
-      curl -s -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
-        -d "tag_name=$NEW_TAG&ref=$CI_COMMIT_SHA&message=Auto-release $NEW_TAG" \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags"
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PERSONAL_TOKEN
-  allow_failure: true
 
 
 # ============================================================
